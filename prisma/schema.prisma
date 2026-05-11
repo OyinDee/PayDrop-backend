@@ -1,0 +1,192 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+// Enums
+enum TransactionStatus {
+  PENDING
+  PROCESSING
+  PENDING_REVIEW
+  COMPLETED
+  FAILED
+  BLOCKED
+}
+
+enum TransactionType {
+  TRANSFER
+  TOP_UP
+  WITHDRAWAL
+}
+
+enum FraudVerdict {
+  ALLOW
+  FLAG
+  BLOCK
+}
+
+enum ActivityLogOperation {
+  OTP_REQUESTED
+  OTP_VERIFIED
+  OTP_FAILED
+  LOGIN_SUCCESS
+  TOKEN_REFRESHED
+  LOGOUT
+  BLE_BROADCAST_START
+  BLE_BROADCAST_STOP
+  BLE_RESOLVE
+  QR_GENERATED
+  QR_SCANNED
+  TRANSFER_INITIATED
+  TRANSFER_FRAUD_SCORED
+  TRANSFER_FLAGGED
+  TRANSFER_FLAG_CONFIRMED
+  TRANSFER_BLOCKED
+  TRANSFER_COMPLETED
+  TRANSFER_FAILED
+  WALLET_FUNDED
+  WITHDRAWAL_INITIATED
+  WITHDRAWAL_COMPLETED
+  WITHDRAWAL_FAILED
+  PROFILE_UPDATED
+  DEVICE_REGISTERED
+  DEVICE_CHANGED
+  FRAUD_REVIEW_SUBMITTED
+  MODEL_RETRAIN_TRIGGERED
+}
+
+// Models
+model User {
+  id                    String        @id @default(uuid())
+  phone                 String        @unique
+  first_name            String
+  last_name             String
+  email                 String?
+  avatar_url            String?
+  squad_virtual_account String?       @unique
+  squad_bank_code       String?
+  kyc_verified          Boolean       @default(false)
+  created_at            DateTime      @default(now())
+  updated_at            DateTime      @updatedAt
+
+  wallet                Wallet?
+  sent                  Transaction[] @relation("sent")
+  received              Transaction[] @relation("received")
+  activity_logs         ActivityLog[]
+  notifications         Notification[]
+  device_tokens         DeviceToken[]
+  fraud_events          FraudEvent[]
+
+  @@map("users")
+}
+
+model Wallet {
+  id         String   @id @default(uuid())
+  user_id    String   @unique
+  balance    BigInt   @default(0)   // KOBO always
+  currency   String   @default("NGN")
+  updated_at DateTime @updatedAt
+
+  user       User     @relation(fields: [user_id], references: [id], onDelete: Cascade)
+
+  @@map("wallets")
+}
+
+model Transaction {
+  id               String            @id @default(uuid())
+  sender_id        String?
+  recipient_id     String?
+  amount           BigInt
+  type             TransactionType
+  status           TransactionStatus @default(PENDING)
+  idempotency_key  String            @unique
+  fraud_score      Int?
+  verdict          FraudVerdict?
+  fraud_reason     String?
+  confirm_token    String?
+  squad_ref        String?
+  note             String?
+  created_at       DateTime          @default(now())
+  updated_at       DateTime          @updatedAt
+
+  sender           User?             @relation("sent",     fields: [sender_id],    references: [id])
+  recipient        User?             @relation("received", fields: [recipient_id], references: [id])
+  fraud_events     FraudEvent[]
+
+  @@index([sender_id])
+  @@index([recipient_id])
+  @@index([status])
+  @@index([sender_id, created_at])
+  @@map("transactions")
+}
+
+model FraudEvent {
+  id              String       @id @default(uuid())
+  transaction_id  String
+  user_id         String
+  score           Int
+  verdict         FraudVerdict
+  features        Json
+  reason          String
+  reviewed_by     String?
+  review_decision String?
+  review_notes    String?
+  reviewed_at     DateTime?
+  created_at      DateTime     @default(now())
+
+  transaction     Transaction  @relation(fields: [transaction_id], references: [id], onDelete: Cascade)
+  user            User         @relation(fields: [user_id],        references: [id])
+
+  @@index([transaction_id])
+  @@index([verdict])
+  @@index([review_decision])
+  @@map("fraud_events")
+}
+
+model ActivityLog {
+  id          String               @id @default(uuid())
+  user_id     String
+  operation   ActivityLogOperation
+  metadata    Json?
+  ip_address  String?
+  device_id   String?
+  created_at  DateTime             @default(now())
+
+  user        User                 @relation(fields: [user_id], references: [id])
+
+  @@index([user_id])
+  @@index([operation])
+  @@index([user_id, operation])
+  @@index([user_id, created_at])
+  @@map("activity_logs")
+}
+
+model Notification {
+  id         String   @id @default(uuid())
+  user_id    String
+  title      String
+  body       String
+  read       Boolean  @default(false)
+  created_at DateTime @default(now())
+
+  user       User     @relation(fields: [user_id], references: [id], onDelete: Cascade)
+
+  @@index([user_id, read])
+  @@map("notifications")
+}
+
+model DeviceToken {
+  id         String   @id @default(uuid())
+  user_id    String
+  device_id  String
+  fcm_token  String
+  updated_at DateTime @updatedAt
+
+  user       User     @relation(fields: [user_id], references: [id], onDelete: Cascade)
+
+  @@unique([user_id, device_id])
+  @@map("device_tokens")
+}
