@@ -205,6 +205,8 @@ export class WalletService {
    * Amount in NAIRA (not kobo)
    */
   async simulateTopup(userId: string, amountNaira: number): Promise<any> {
+
+
     const user = await this.prisma.user.findUnique({
       where: { id: userId },
     });
@@ -214,15 +216,19 @@ export class WalletService {
     }
 
     try {
-      await this.squadService.simulateTopup(
+      const squadRef = await this.squadService.simulateTopup(
         user.squad_virtual_account,
         amountNaira,
       );
 
-      await this.activityLog.log(userId, 'WALLET_FUNDED', {
-        amount: amountNaira * 100, // Convert to kobo for logging
-        source: 'simulation',
-      });
+      const amountKobo = Math.round(amountNaira * 100);
+      const safeRef = squadRef || `sim_${Date.now()}_${userId}`;
+
+      await this.processWebhookPayment(
+        user.squad_virtual_account,
+        amountKobo,
+        safeRef,
+      );
 
       return {
         success: true,
@@ -252,45 +258,49 @@ export class WalletService {
       throw new NotFoundException('Virtual account not found');
     }
 
-    // Duplicate guard: check squad_ref in Redis
-    const isDuplicate = await this.redisService.exists(`squad_ref:${squadRef}`);
-    if (isDuplicate) {
-      return; // Already processed
+    // Duplicate guard (atomic): only one worker should process a squadRef
+    const dedupeKey = `squad_ref:${squadRef}`;
+    const acquired = await this.redisService.setIfNotExists(
+      dedupeKey,
+      '1',
+      86400,
+    );
+    if (!acquired) {
+      return;
     }
 
-    // Atomic transaction
-    await this.prisma.$transaction(async (tx: any) => {
-      // Update wallet
-      await tx.wallet.update({
-        where: { user_id: user.id },
-        data: {
-          balance: {
-            increment: BigInt(amount),
+    try {
+      // Atomic DB transaction
+      await this.prisma.$transaction(async (tx: any) => {
+        await tx.wallet.update({
+          where: { user_id: user.id },
+          data: {
+            balance: {
+              increment: BigInt(amount),
+            },
           },
-        },
-      });
+        });
 
-      // Create transaction record
-      await tx.transaction.create({
-        data: {
-          recipient_id: user.id,
-          amount: BigInt(amount),
-          type: 'TOP_UP',
-          status: 'COMPLETED',
+        await tx.transaction.create({
+          data: {
+            recipient_id: user.id,
+            amount: BigInt(amount),
+            type: 'TOP_UP',
+            status: 'COMPLETED',
+            squad_ref: squadRef,
+            idempotency_key: `webhook_${squadRef}`,
+          },
+        });
+
+        await this.activityLog.log(user.id, 'WALLET_FUNDED', {
+          amount,
           squad_ref: squadRef,
-          idempotency_key: `webhook_${squadRef}`, // Synthetic key for webhook
-        },
+        });
       });
-
-      // Activity log
-      await this.activityLog.log(user.id, 'WALLET_FUNDED', {
-        amount,
-        squad_ref: squadRef,
-      });
-    });
-
-    // Set dedup guard in Redis (24 hour TTL)
-    await this.redisService.set(`squad_ref:${squadRef}`, true, 86400);
+    } catch (e) {
+      await this.redisService.del(dedupeKey);
+      throw e;
+    }
   }
 
   /**

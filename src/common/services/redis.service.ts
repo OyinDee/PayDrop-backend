@@ -85,6 +85,23 @@ export class RedisService {
   }
 
   /**
+   * Atomic set-if-not-exists with TTL (seconds)
+   * Returns true if key was set, false if it already existed.
+   */
+  async setIfNotExists(
+    key: string,
+    value: string,
+    ttlSeconds: number,
+  ): Promise<boolean> {
+    const ttl = Number(ttlSeconds);
+    const ok = await this.client.set(key, value, {
+      NX: true,
+      EX: Number.isFinite(ttl) && ttl > 0 ? ttl : 60,
+    });
+    return ok === 'OK';
+  }
+
+  /**
    * Delete key from Redis
    */
   async del(key: string | string[]): Promise<number> {

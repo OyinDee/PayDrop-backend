@@ -45,7 +45,17 @@ async function bootstrap() {
       },
       'bearer',
     )
+    .addApiKey(
+      {
+        type: 'apiKey',
+        name: 'x-device-id',
+        in: 'header',
+        description: 'Device identifier header (required for protected endpoints)',
+      },
+      'deviceId',
+    )
     .addSecurityRequirements('bearer')
+    .addSecurityRequirements('deviceId')
     .addTag('Auth', 'Phone OTP-based authentication')
     .addTag('Users', 'User profiles and wallets')
     .addTag('Discovery', 'BLE and QR code discovery')

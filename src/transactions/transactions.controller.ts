@@ -2,7 +2,7 @@ import { Controller, Post, Get, Param, Body, UseGuards, Query } from '@nestjs/co
 import { ApiTags, ApiOperation, ApiResponse, ApiBearerAuth, ApiParam, ApiHeader } from '@nestjs/swagger';
 import { TransactionsService } from './transactions.service';
 import { CurrentUser } from '../common/decorators/current-user.decorator';
-import { JwtGuard } from '../common/guards/jwt.guard';
+import { JwtAuthGuard } from '../common/guards/jwt-auth.guard';
 import {
   TransferDto,
   ConfirmTransferDto,
@@ -24,7 +24,7 @@ export class TransactionsController {
   constructor(private transactionsService: TransactionsService) {}
 
   @Post('transfer')
-  @UseGuards(JwtGuard)
+  @UseGuards(JwtAuthGuard)
   @ApiBearerAuth()
   @ApiOperation({
     summary: 'Initiate Transfer',
@@ -65,7 +65,7 @@ export class TransactionsController {
   }
 
   @Post('transfer/confirm')
-  @UseGuards(JwtGuard)
+  @UseGuards(JwtAuthGuard)
   @ApiBearerAuth()
   @ApiOperation({
     summary: 'Confirm Flagged Transfer',
@@ -89,7 +89,7 @@ export class TransactionsController {
   }
 
   @Get()
-  @UseGuards(JwtGuard)
+  @UseGuards(JwtAuthGuard)
   @ApiBearerAuth()
   @ApiOperation({
     summary: 'Get Transaction History',
@@ -117,7 +117,7 @@ export class TransactionsController {
   }
 
   @Get(':id')
-  @UseGuards(JwtGuard)
+  @UseGuards(JwtAuthGuard)
   @ApiBearerAuth()
   @ApiOperation({
     summary: 'Get Transaction Detail',
@@ -136,7 +136,7 @@ export class TransactionsController {
   }
 
   @Get(':id/fraud-detail')
-  @UseGuards(JwtGuard)
+  @UseGuards(JwtAuthGuard)
   @ApiBearerAuth()
   @ApiOperation({
     summary: 'Get Fraud Scoring Details',

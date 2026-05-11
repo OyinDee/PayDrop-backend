@@ -71,7 +71,7 @@ export class DiscoverService {
         first_name: u.first_name,
         last_name: u.last_name,
         avatar_url: u.avatar_url,
-        trust_tier: trustValues[idx] || 'LOW',
+        trust_tier: trustValues[idx] || 'MEDIUM',
       })),
     };
   }
@@ -117,7 +117,7 @@ export class DiscoverService {
     }
 
     const trustTier =
-      (await this.redis.get<string>(`${this.TRUST_KEY_PREFIX}${user.id}`)) || 'LOW';
+      (await this.redis.get<string>(`${this.TRUST_KEY_PREFIX}${user.id}`)) || 'MEDIUM';
 
     return {
       user: {

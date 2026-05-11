@@ -2,7 +2,7 @@ import { Controller, Post, Get, Patch, Param, Body, UseGuards } from '@nestjs/co
 import { ApiTags, ApiOperation, ApiResponse, ApiBearerAuth, ApiParam, ApiHeader } from '@nestjs/swagger';
 import { NotificationsService } from './notifications.service';
 import { CurrentUser } from '../common/decorators/current-user.decorator';
-import { JwtGuard } from '../common/guards/jwt.guard';
+import { JwtAuthGuard } from '../common/guards/jwt-auth.guard';
 import {
   RegisterDeviceDto,
   RegisterDeviceResponseDto,
@@ -21,7 +21,7 @@ export class NotificationsController {
   constructor(private notificationsService: NotificationsService) {}
 
   @Post('register-device')
-  @UseGuards(JwtGuard)
+  @UseGuards(JwtAuthGuard)
   @ApiBearerAuth()
   @ApiOperation({
     summary: 'Register FCM Device Token',
@@ -45,7 +45,7 @@ export class NotificationsController {
   }
 
   @Get()
-  @UseGuards(JwtGuard)
+  @UseGuards(JwtAuthGuard)
   @ApiBearerAuth()
   @ApiOperation({
     summary: 'Get Notifications',
@@ -67,7 +67,7 @@ export class NotificationsController {
   }
 
   @Patch(':id/read')
-  @UseGuards(JwtGuard)
+  @UseGuards(JwtAuthGuard)
   @ApiBearerAuth()
   @ApiOperation({
     summary: 'Mark Notification as Read',
@@ -86,7 +86,7 @@ export class NotificationsController {
   }
 
   @Patch('read-all')
-  @UseGuards(JwtGuard)
+  @UseGuards(JwtAuthGuard)
   @ApiBearerAuth()
   @ApiOperation({
     summary: 'Mark All Notifications as Read',

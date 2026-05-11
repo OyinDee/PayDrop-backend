@@ -174,7 +174,7 @@ export class SquadService {
   async simulateTopup(
     virtualAccountNumber: string,
     amount: number, // in NAIRA (NOT kobo)
-  ): Promise<void> {
+  ): Promise<string | null> {
     try {
       const response = await this.client.post(
         '/virtual-account/simulate/payment',
@@ -187,6 +187,19 @@ export class SquadService {
       if (response.status !== 200) {
         throw new Error('Simulation failed');
       }
+
+      const data = (response.data && (response.data.data ?? response.data)) as any;
+      const transactionRef =
+        data?.transaction_ref ??
+        data?.transaction_reference ??
+        data?.transactionRef ??
+        data?.reference ??
+        data?.ref ??
+        null;
+
+      return typeof transactionRef === 'string' && transactionRef.trim().length > 0
+        ? transactionRef
+        : null;
     } catch (error) {
       const msg = getAxiosErrorMessage(error);
       if (axios.isAxiosError(error)) {

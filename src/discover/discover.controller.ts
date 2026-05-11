@@ -2,7 +2,7 @@ import { Controller, Post, Get, Delete, Body, UseGuards } from '@nestjs/common';
 import { ApiTags, ApiOperation, ApiResponse, ApiBearerAuth, ApiHeader } from '@nestjs/swagger';
 import { DiscoverService } from './discover.service';
 import { CurrentUser } from '../common/decorators/current-user.decorator';
-import { JwtGuard } from '../common/guards/jwt.guard';
+import { JwtAuthGuard } from '../common/guards/jwt-auth.guard';
 import {
   BroadcastBleDto,
   BroadcastResponseDto,
@@ -24,7 +24,7 @@ export class DiscoverController {
   constructor(private discoverService: DiscoverService) {}
 
   @Post('broadcast')
-  @UseGuards(JwtGuard)
+  @UseGuards(JwtAuthGuard)
   @ApiBearerAuth()
   @ApiOperation({
     summary: 'Register BLE Token',
@@ -45,7 +45,7 @@ export class DiscoverController {
   }
 
   @Post('resolve')
-  @UseGuards(JwtGuard)
+  @UseGuards(JwtAuthGuard)
   @ApiBearerAuth()
   @ApiOperation({
     summary: 'Resolve BLE Tokens',
@@ -66,7 +66,7 @@ export class DiscoverController {
   }
 
   @Get('qr')
-  @UseGuards(JwtGuard)
+  @UseGuards(JwtAuthGuard)
   @ApiBearerAuth()
   @ApiOperation({
     summary: 'Get QR Token',
@@ -83,7 +83,7 @@ export class DiscoverController {
   }
 
   @Post('qr/resolve')
-  @UseGuards(JwtGuard)
+  @UseGuards(JwtAuthGuard)
   @ApiBearerAuth()
   @ApiOperation({
     summary: 'Resolve QR Token',
@@ -100,7 +100,7 @@ export class DiscoverController {
   }
 
   @Delete('broadcast')
-  @UseGuards(JwtGuard)
+  @UseGuards(JwtAuthGuard)
   @ApiBearerAuth()
   @ApiOperation({
     summary: 'Remove BLE Token',
