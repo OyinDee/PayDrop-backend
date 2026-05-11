@@ -153,6 +153,10 @@ export class WebhooksService {
   @Cron('0 */30 * * * *')
   async recoverMissedWebhooks(): Promise<void> {
     const missed = await this.squad.getMissedWebhooks();
+    if (!Array.isArray(missed) || missed.length === 0) {
+      return;
+    }
+
     for (const tx of missed) {
       const ref =
         tx?.transaction_ref || tx?.transactionRef || tx?.reference || tx?.data?.transaction_ref;

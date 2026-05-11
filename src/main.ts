@@ -43,8 +43,9 @@ async function bootstrap() {
         bearerFormat: 'JWT',
         description: 'Enter JWT token',
       },
-      'access_token',
+      'bearer',
     )
+    .addSecurityRequirements('bearer')
     .addTag('Auth', 'Phone OTP-based authentication')
     .addTag('Users', 'User profiles and wallets')
     .addTag('Discovery', 'BLE and QR code discovery')
@@ -62,8 +63,8 @@ async function bootstrap() {
 
   const port = process.env.PORT || 3000;
   await app.listen(port);
-  console.log(`🚀 PayDrop API is running on http://localhost:${port}`);
-  console.log(`📚 Swagger docs available at http://localhost:${port}/docs`);
+  console.log(`PayDrop API is running on http://localhost:${port}`);
+  console.log(`Swagger docs available at http://localhost:${port}/docs`);
 }
 
 bootstrap();

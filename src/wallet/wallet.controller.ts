@@ -5,12 +5,18 @@ import {
   ApiResponse,
   ApiBearerAuth,
   ApiBody,
+  ApiHeader,
 } from '@nestjs/swagger';
 import { WalletService } from './wallet.service';
 import { CurrentUser } from '../common/decorators/current-user.decorator';
 import { JwtAuthGuard } from '../common/guards/jwt-auth.guard';
 
 @ApiTags('Wallet')
+@ApiHeader({
+  name: 'x-device-id',
+  required: true,
+  description: 'Device identifier required for authenticated requests',
+})
 @Controller('wallet')
 export class WalletController {
   constructor(private walletService: WalletService) {}

@@ -1,5 +1,5 @@
 import { Controller, Post, Get, Delete, Body, UseGuards } from '@nestjs/common';
-import { ApiTags, ApiOperation, ApiResponse, ApiBearerAuth } from '@nestjs/swagger';
+import { ApiTags, ApiOperation, ApiResponse, ApiBearerAuth, ApiHeader } from '@nestjs/swagger';
 import { DiscoverService } from './discover.service';
 import { CurrentUser } from '../common/decorators/current-user.decorator';
 import { JwtGuard } from '../common/guards/jwt.guard';
@@ -14,6 +14,11 @@ import {
 } from './dto/discover.dto';
 
 @ApiTags('Discovery')
+@ApiHeader({
+  name: 'x-device-id',
+  required: true,
+  description: 'Device identifier required for authenticated requests',
+})
 @Controller('discover')
 export class DiscoverController {
   constructor(private discoverService: DiscoverService) {}

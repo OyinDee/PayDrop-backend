@@ -209,7 +209,26 @@ export class SquadService {
       if (response.status !== 200 || !response.data?.data) {
         return [];
       }
-      return response.data.data;
+      const data = response.data.data;
+      if (Array.isArray(data)) {
+        return data;
+      }
+
+      if (data && typeof data === 'object') {
+        const candidates = [
+          (data as any).logs,
+          (data as any).items,
+          (data as any).records,
+          (data as any).data,
+        ];
+        for (const c of candidates) {
+          if (Array.isArray(c)) {
+            return c;
+          }
+        }
+      }
+
+      return [];
     } catch (error) {
       console.error('Squad get missed webhooks error:', error);
       return [];

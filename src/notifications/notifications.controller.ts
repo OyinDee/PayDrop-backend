@@ -1,5 +1,5 @@
 import { Controller, Post, Get, Patch, Param, Body, UseGuards } from '@nestjs/common';
-import { ApiTags, ApiOperation, ApiResponse, ApiBearerAuth, ApiParam } from '@nestjs/swagger';
+import { ApiTags, ApiOperation, ApiResponse, ApiBearerAuth, ApiParam, ApiHeader } from '@nestjs/swagger';
 import { NotificationsService } from './notifications.service';
 import { CurrentUser } from '../common/decorators/current-user.decorator';
 import { JwtGuard } from '../common/guards/jwt.guard';
@@ -11,6 +11,11 @@ import {
 } from './dto/notification.dto';
 
 @ApiTags('Notifications')
+@ApiHeader({
+  name: 'x-device-id',
+  required: true,
+  description: 'Device identifier required for authenticated requests',
+})
 @Controller('notifications')
 export class NotificationsController {
   constructor(private notificationsService: NotificationsService) {}

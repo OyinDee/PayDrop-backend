@@ -5,6 +5,7 @@ import {
   ApiResponse,
   ApiBody,
   ApiBearerAuth,
+  ApiHeader,
 } from '@nestjs/swagger';
 import { AuthService } from './auth.service';
 import { CurrentUser } from '../common/decorators/current-user.decorator';
@@ -79,6 +80,11 @@ export class AuthController {
   @Post('logout')
   @UseGuards(JwtAuthGuard)
   @ApiBearerAuth()
+  @ApiHeader({
+    name: 'x-device-id',
+    required: true,
+    description: 'Device identifier required for authenticated requests',
+  })
   @ApiOperation({
     summary: 'Logout',
     description: 'Delete refresh token from Redis. Access token expires naturally.',

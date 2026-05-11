@@ -141,6 +141,12 @@ export class AuthService {
       };
     }
 
+    if (!first_name || !last_name) {
+      throw new BadRequestException(
+        'first_name and last_name are required for first login',
+      );
+    }
+
     // First login - atomic transaction
     try {
       const user = await (this.prisma as any).$transaction(async (tx: any) => {

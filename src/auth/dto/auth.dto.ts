@@ -34,18 +34,22 @@ export class VerifyOtpDto {
   otp: string;
 
   @ApiProperty({
-    description: 'First name (REQUIRED for first login)',
+    description: 'First name (required for first login only)',
     example: 'Oyindamola',
+    required: false,
   })
+  @IsOptional()
   @IsString()
-  first_name: string;
+  first_name?: string;
 
   @ApiProperty({
-    description: 'Last name (REQUIRED for first login)',
+    description: 'Last name (required for first login only)',
     example: 'Ajala',
+    required: false,
   })
+  @IsOptional()
   @IsString()
-  last_name: string;
+  last_name?: string;
 
   @ApiProperty({
     description: 'Email address (optional)',

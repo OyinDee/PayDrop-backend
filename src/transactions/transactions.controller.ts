@@ -1,5 +1,5 @@
 import { Controller, Post, Get, Param, Body, UseGuards, Query } from '@nestjs/common';
-import { ApiTags, ApiOperation, ApiResponse, ApiBearerAuth, ApiParam } from '@nestjs/swagger';
+import { ApiTags, ApiOperation, ApiResponse, ApiBearerAuth, ApiParam, ApiHeader } from '@nestjs/swagger';
 import { TransactionsService } from './transactions.service';
 import { CurrentUser } from '../common/decorators/current-user.decorator';
 import { JwtGuard } from '../common/guards/jwt.guard';
@@ -14,6 +14,11 @@ import {
 } from './dto/transaction.dto';
 
 @ApiTags('Transactions')
+@ApiHeader({
+  name: 'x-device-id',
+  required: true,
+  description: 'Device identifier required for authenticated requests',
+})
 @Controller('transactions')
 export class TransactionsController {
   constructor(private transactionsService: TransactionsService) {}
