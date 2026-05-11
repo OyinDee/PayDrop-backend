@@ -9,7 +9,6 @@ import { ResponseEnvelopeInterceptor } from './common/interceptors/response-enve
 async function bootstrap() {
   const app = await NestFactory.create(AppModule);
 
-  // Capture raw body for webhook signature validation
   app.use(
     bodyParser.json({
       verify: (req: any, _res, buf) => {
@@ -28,30 +27,18 @@ async function bootstrap() {
   }));
 
   app.enableCors();
-
   app.setGlobalPrefix('api/v1');
 
-  // Swagger documentation
   const config = new DocumentBuilder()
     .setTitle('PayDrop API')
     .setDescription('Peer-to-peer payment platform with OTP authentication, BLE discovery, and fraud pre-scoring')
     .setVersion('1.0.0')
     .addBearerAuth(
-      {
-        type: 'http',
-        scheme: 'bearer',
-        bearerFormat: 'JWT',
-        description: 'Enter JWT token',
-      },
+      { type: 'http', scheme: 'bearer', bearerFormat: 'JWT', description: 'Enter JWT token' },
       'bearer',
     )
     .addApiKey(
-      {
-        type: 'apiKey',
-        name: 'x-device-id',
-        in: 'header',
-        description: 'Device identifier header (required for protected endpoints)',
-      },
+      { type: 'apiKey', name: 'x-device-id', in: 'header', description: 'Device identifier header' },
       'deviceId',
     )
     .addSecurityRequirements('bearer')
@@ -65,7 +52,13 @@ async function bootstrap() {
     .build();
 
   const document = SwaggerModule.createDocument(app, config);
+
   SwaggerModule.setup('docs', app, document, {
+    customCssUrl: 'https://unpkg.com/swagger-ui-dist@5/swagger-ui.css',
+    customJs: [
+      'https://unpkg.com/swagger-ui-dist@5/swagger-ui-bundle.js',
+      'https://unpkg.com/swagger-ui-dist@5/swagger-ui-standalone-preset.js',
+    ],
     swaggerOptions: {
       persistAuthorization: true,
     },
@@ -73,8 +66,8 @@ async function bootstrap() {
 
   const port = process.env.PORT || 3000;
   await app.listen(port);
-  console.log(`PayDrop API is running on http://localhost:${port}`);
-  console.log(`Swagger docs available at http://localhost:${port}/docs`);
+  console.log(`PayDrop API running on http://localhost:${port}`);
+  console.log(`Swagger docs at http://localhost:${port}/docs`);
 }
 
 bootstrap();
