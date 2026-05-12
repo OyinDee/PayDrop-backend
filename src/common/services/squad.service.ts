@@ -9,10 +9,12 @@ export class SquadService {
   private secretKey: string | undefined;
   private webhookSecret: string | undefined;
   private merchantId: string | undefined;
+  private isSandbox: boolean;
   private testBvn: string | undefined;
   private testDob: string | undefined;
   private beneficiaryAccount: string | undefined;
   private beneficiaryBankCode: string | undefined;
+  private sandboxDefaultNipCode: string;
 
   constructor(private configService: ConfigService) {
     this.secretKey = this.configService.get<string>('SQUAD_SECRET_KEY');
@@ -32,6 +34,15 @@ export class SquadService {
     const baseURL = this.configService.get<string>('SQUAD_BASE_URL') ||
       'https://sandbox-api-d.squadco.com';
 
+    this.isSandbox = baseURL.toLowerCase().includes('sandbox');
+
+    const configuredSandboxNip = this.configService.get<string>(
+      'SQUAD_SANDBOX_DEFAULT_NIP_CODE',
+    );
+    this.sandboxDefaultNipCode = (
+      configuredSandboxNip || this.beneficiaryBankCode || '000013'
+    ).trim();
+
     if (!this.secretKey || !this.webhookSecret) {
       throw new Error('SQUAD_SECRET_KEY and SQUAD_WEBHOOK_SECRET must be configured');
     }
@@ -43,6 +54,52 @@ export class SquadService {
         'Content-Type': 'application/json',
       },
     });
+  }
+
+  private resolveNipCode(inputNipCode: string): string {
+    const nipCode = String(inputNipCode || '').trim();
+    const isValidNip = /^\d{6}$/.test(nipCode);
+
+    if (isValidNip) return nipCode;
+    if (this.isSandbox && /^\d{6}$/.test(this.sandboxDefaultNipCode)) {
+      return this.sandboxDefaultNipCode;
+    }
+
+    throw new BadRequestException(
+      'Invalid nip_code; expected a 6-digit NIP bank code',
+    );
+  }
+
+  private async postPayoutWithCodeFallback<T>(
+    path: string,
+    resolvedCode: string,
+    payloadWithoutCode: Record<string, unknown>,
+  ): Promise<T> {
+    const bankCodePayload = {
+      ...payloadWithoutCode,
+      bank_code: resolvedCode,
+    };
+    const nipCodePayload = {
+      ...payloadWithoutCode,
+      nip_code: resolvedCode,
+    };
+
+    try {
+      const res = await this.client.post(path, bankCodePayload);
+      return res as unknown as T;
+    } catch (error) {
+      if (!axios.isAxiosError(error)) throw error;
+
+      const msg = String(error.response?.data?.message || '').toLowerCase();
+      const shouldRetryWithNip =
+        (msg.includes('nip_code') && msg.includes('required')) ||
+        (msg.includes('bank_code') && (msg.includes('is not allowed') || msg.includes('not allowed')));
+
+      if (!shouldRetryWithNip) throw error;
+
+      const res = await this.client.post(path, nipCodePayload);
+      return res as unknown as T;
+    }
   }
 
   /**
@@ -113,10 +170,14 @@ export class SquadService {
     accountNumber: string,
   ): Promise<{ account_name: string; nip_code: string }> {
     try {
-      const response = await this.client.post('/payout/account/lookup', {
-        nip_code: nipCode,
-        account_number: accountNumber,
-      });
+      const resolvedNipCode = this.resolveNipCode(nipCode);
+      const response = await this.postPayoutWithCodeFallback<any>(
+        '/payout/account/lookup',
+        resolvedNipCode,
+        {
+          account_number: accountNumber,
+        },
+      );
 
       if (response.status !== 200 || !response.data?.data) {
         throw new Error('Account not found');
@@ -125,7 +186,7 @@ export class SquadService {
       const d = response.data.data as Record<string, unknown>;
       return {
         account_name: String(d.account_name ?? ''),
-        nip_code: String(d.nip_code ?? nipCode),
+        nip_code: String(d.nip_code ?? resolvedNipCode),
       };
     } catch (error) {
       const msg = getAxiosErrorMessage(error);
@@ -153,6 +214,7 @@ export class SquadService {
     narration?: string,
   ): Promise<{ transaction_ref: string; status: string }> {
     try {
+      const resolvedNipCode = this.resolveNipCode(nipCode);
       if (!this.merchantId?.trim()) {
         throw new Error(
           'SQUAD_MERCHANT_ID is required for payout transfers (prefix for transaction_reference)',
@@ -162,15 +224,18 @@ export class SquadService {
       const transactionReference = `${this.merchantId.trim()}_pd_${randomUUID()}`;
       const remark = (narration || 'PayDrop Transfer').slice(0, 120);
 
-      const response = await this.client.post('/payout/transfer', {
-        transaction_reference: transactionReference,
-        amount: String(Math.floor(amount)),
-        nip_code: nipCode,
-        account_number: accountNumber,
-        account_name: accountName,
-        currency_id: 'NGN',
-        remark,
-      });
+      const response = await this.postPayoutWithCodeFallback<any>(
+        '/payout/transfer',
+        resolvedNipCode,
+        {
+          transaction_reference: transactionReference,
+          amount: String(Math.floor(amount)),
+          account_number: accountNumber,
+          account_name: accountName,
+          currency_id: 'NGN',
+          remark,
+        },
+      );
 
       if (response.status !== 200 || !response.data?.data) {
         throw new Error('Transfer initiation failed');

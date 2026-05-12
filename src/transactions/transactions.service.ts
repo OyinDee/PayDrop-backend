@@ -31,6 +31,7 @@ export class TransactionsService {
     amount: number,
     idempotencyKey: string,
     note?: string,
+    nipCode?: string,
   ) {
     if (recipientId === senderId) {
       throw new BadRequestException('Cannot transfer to yourself');
@@ -126,6 +127,7 @@ export class TransactionsService {
       });
 
       const confirmToken = uuidv4();
+      const recipientNipCode = (nipCode || recipient.squad_bank_code || '').trim();
       await this.redis.set(
         `confirm:${confirmToken}`,
         {
@@ -133,6 +135,7 @@ export class TransactionsService {
           sender_id: senderId,
           recipient_id: recipientId,
           amount: Number(amountKobo),
+          nip_code: recipientNipCode,
         },
         this.CONFIRM_TTL_SECONDS,
       );
@@ -171,14 +174,16 @@ export class TransactionsService {
       }
 
       // Verify recipient has Squad details
-      if (!recipient.squad_virtual_account || !recipient.squad_bank_code) {
+      if (!recipient.squad_virtual_account) {
         throw new BadRequestException('Recipient cannot receive transfers yet');
       }
+
+      const recipientNipCode = (nipCode || recipient.squad_bank_code || '').trim();
 
       // Optional: verify recipient name (contract says account lookup)
       // We do a best-effort lookup; if it fails, we still stop (safer).
       const lookup = await this.squad.lookupAccount(
-        recipient.squad_bank_code,  // NIP code (6 chars)
+        recipientNipCode,  // NIP code (6 chars)
         recipient.squad_virtual_account,
       );
       const recipientName = `${recipient.first_name} ${recipient.last_name}`.trim();
@@ -191,7 +196,7 @@ export class TransactionsService {
 
       const squadTransfer = await this.squad.initiateTransfer(
         Number(amountKobo),
-        recipient.squad_bank_code,  // NIP code (6 chars)
+        recipientNipCode,  // NIP code (6 chars)
         recipient.squad_virtual_account,
         lookup.account_name || recipientName,
         'PayDrop P2P Transfer',
@@ -258,9 +263,11 @@ export class TransactionsService {
     // Re-run ALLOW path initiation (same logic as transfer allow, but use existing tx row + idempotency_key)
     const recipient = await this.prisma.user.findUnique({ where: { id: tx.recipient_id || '' } });
     if (!recipient) throw new NotFoundException('Recipient not found');
-    if (!recipient.squad_virtual_account || !recipient.squad_bank_code) {
+    if (!recipient.squad_virtual_account) {
       throw new BadRequestException('Recipient cannot receive transfers yet');
     }
+
+    const recipientNipCode = ((payload as any)?.nip_code || recipient.squad_bank_code || '').trim();
 
     const initiated = (await this.prisma.$transaction(async (p: any) => {
       await p.$queryRaw`SELECT 1 FROM wallets WHERE user_id = ${senderId} FOR UPDATE`;
@@ -270,7 +277,7 @@ export class TransactionsService {
       }
 
       const lookup = await this.squad.lookupAccount(
-        recipient.squad_bank_code,  // NIP code (6 chars)
+        recipientNipCode,  // NIP code (6 chars)
         recipient.squad_virtual_account,
       );
       const recipientName = `${recipient.first_name} ${recipient.last_name}`.trim();
@@ -283,7 +290,7 @@ export class TransactionsService {
 
       const squadTransfer = await this.squad.initiateTransfer(
         Number(tx.amount),
-        recipient.squad_bank_code,  // NIP code (6 chars)
+        recipientNipCode,  // NIP code (6 chars)
         recipient.squad_virtual_account,
         lookup.account_name || recipientName,
         'PayDrop P2P Transfer',

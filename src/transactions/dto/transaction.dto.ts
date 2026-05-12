@@ -32,6 +32,16 @@ export class TransferDto {
   @IsOptional()
   @IsString()
   note?: string;
+
+  @ApiProperty({
+    description:
+      'Optional NIP code override (Squad payout bank code). For sandbox, PayDrop will default to the GT/Squad sandbox NIP code if missing/invalid.',
+    example: '000013',
+    required: false,
+  })
+  @IsOptional()
+  @IsString()
+  nip_code?: string;
 }
 
 export class ConfirmTransferDto {

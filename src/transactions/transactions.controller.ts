@@ -62,6 +62,7 @@ export class TransactionsController {
       body.amount,
       body.idempotency_key,
       body.note,
+      body.nip_code,
     );
   }
 
