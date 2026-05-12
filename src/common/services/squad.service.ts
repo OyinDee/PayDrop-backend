@@ -104,16 +104,17 @@ export class SquadService {
   }
 
   /**
-   * NIP account lookup before payout (Squad Transfer / Payout API).
+   * NIP account lookup before payout (Squad Payout API).
+   * Squad expects nip_code (6-char bank code) not bank_code.
    * @see https://docs.squadco.com/Transfer-API/transfer-apis
    */
   async lookupAccount(
-    bankCode: string,
+    nipCode: string,
     accountNumber: string,
-  ): Promise<{ account_name: string; bank_code: string }> {
+  ): Promise<{ account_name: string; nip_code: string }> {
     try {
       const response = await this.client.post('/payout/account/lookup', {
-        bank_code: bankCode,
+        nip_code: nipCode,
         account_number: accountNumber,
       });
 
@@ -124,7 +125,7 @@ export class SquadService {
       const d = response.data.data as Record<string, unknown>;
       return {
         account_name: String(d.account_name ?? ''),
-        bank_code: String(d.bank_code ?? bankCode),
+        nip_code: String(d.nip_code ?? nipCode),
       };
     } catch (error) {
       const msg = getAxiosErrorMessage(error);
@@ -146,7 +147,7 @@ export class SquadService {
    */
   async initiateTransfer(
     amount: number, // kobo
-    bankCode: string,
+    nipCode: string,
     accountNumber: string,
     accountName: string,
     narration?: string,
@@ -164,7 +165,7 @@ export class SquadService {
       const response = await this.client.post('/payout/transfer', {
         transaction_reference: transactionReference,
         amount: String(Math.floor(amount)),
-        bank_code: bankCode,
+        nip_code: nipCode,
         account_number: accountNumber,
         account_name: accountName,
         currency_id: 'NGN',

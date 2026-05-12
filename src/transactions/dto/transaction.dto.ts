@@ -105,8 +105,8 @@ export class TransferAllowedDto {
   verdict: string;
 
   @ApiProperty({
-    description: 'Squad transaction reference',
-    example: 'SQ_REF_12345',
+    description: 'Squad transaction reference (from POST /payout/transfer)',
+    example: 'SBPJ4U4VU6_pd_550e8400-e29b-41d4-a716-446655440000',
   })
   squad_ref: string;
 }
@@ -219,9 +219,8 @@ export class TransactionDto {
   note: string | null;
 
   @ApiProperty({
-    description: 'Squad reference',
-    example: 'SQ_REF_12345',
-    nullable: true,
+    description: 'Squad transaction reference (from POST /payout/transfer)',
+    example: 'SBPJ4U4VU6_pd_550e8400-e29b-41d4-a716-446655440000',
   })
   squad_ref: string | null;
 

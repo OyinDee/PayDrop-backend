@@ -14,7 +14,7 @@ import { ActivityLogService } from '../common/services/activity-log.service';
 
 @Injectable()
 export class TransactionsService {
-  private readonly MIN_TRANSFER = 10000n; // NGN 100
+  private readonly MIN_TRANSFER = 100n; // NGN 100
   private readonly CONFIRM_TTL_SECONDS = 900; // 15min
 
   constructor(
@@ -178,7 +178,7 @@ export class TransactionsService {
       // Optional: verify recipient name (contract says account lookup)
       // We do a best-effort lookup; if it fails, we still stop (safer).
       const lookup = await this.squad.lookupAccount(
-        recipient.squad_bank_code,
+        recipient.squad_bank_code,  // NIP code (6 chars)
         recipient.squad_virtual_account,
       );
       const recipientName = `${recipient.first_name} ${recipient.last_name}`.trim();
@@ -191,7 +191,7 @@ export class TransactionsService {
 
       const squadTransfer = await this.squad.initiateTransfer(
         Number(amountKobo),
-        recipient.squad_bank_code,
+        recipient.squad_bank_code,  // NIP code (6 chars)
         recipient.squad_virtual_account,
         lookup.account_name || recipientName,
         'PayDrop P2P Transfer',
@@ -270,7 +270,7 @@ export class TransactionsService {
       }
 
       const lookup = await this.squad.lookupAccount(
-        recipient.squad_bank_code,
+        recipient.squad_bank_code,  // NIP code (6 chars)
         recipient.squad_virtual_account,
       );
       const recipientName = `${recipient.first_name} ${recipient.last_name}`.trim();
@@ -283,7 +283,7 @@ export class TransactionsService {
 
       const squadTransfer = await this.squad.initiateTransfer(
         Number(tx.amount),
-        recipient.squad_bank_code,
+        recipient.squad_bank_code,  // NIP code (6 chars)
         recipient.squad_virtual_account,
         lookup.account_name || recipientName,
         'PayDrop P2P Transfer',

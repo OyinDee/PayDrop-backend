@@ -1,5 +1,5 @@
 import { Controller, Post, Get, Param, Body, UseGuards, Query } from '@nestjs/common';
-import { ApiTags, ApiOperation, ApiResponse, ApiBearerAuth, ApiParam, ApiHeader } from '@nestjs/swagger';
+import { ApiTags, ApiOperation, ApiResponse, ApiBearerAuth, ApiParam, ApiHeader, ApiExtraModels, getSchemaPath } from '@nestjs/swagger';
 import { TransactionsService } from './transactions.service';
 import { CurrentUser } from '../common/decorators/current-user.decorator';
 import { JwtAuthGuard } from '../common/guards/jwt-auth.guard';
@@ -14,6 +14,7 @@ import {
 } from './dto/transaction.dto';
 
 @ApiTags('Transactions')
+@ApiExtraModels(TransferAllowedDto, TransferFlaggedDto, TransferBlockedDto)
 @ApiHeader({
   name: 'x-device-id',
   required: true,
@@ -29,15 +30,15 @@ export class TransactionsController {
   @ApiOperation({
     summary: 'Initiate Transfer',
     description:
-      'Initiate a transfer. Pre-scores via fraud engine, then calls Squad Transfer API if allowed.',
+      'Initiate a transfer between PayDrop users. Performs fraud pre-scoring, looks up recipient bank details via POST /payout/account/lookup, then initiates payout via POST /payout/transfer if allowed by fraud engine. Returns COMPLETED for low-risk or PENDING_REVIEW for flagged transfers.',
   })
   @ApiResponse({
     status: 200,
     description: 'Transfer completed or flagged for review',
     schema: {
       oneOf: [
-        { $ref: '#/components/schemas/TransferAllowedDto' },
-        { $ref: '#/components/schemas/TransferFlaggedDto' },
+        { $ref: getSchemaPath(TransferAllowedDto) },
+        { $ref: getSchemaPath(TransferFlaggedDto) },
       ],
     },
   })
