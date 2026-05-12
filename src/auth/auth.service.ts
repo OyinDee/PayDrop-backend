@@ -3,6 +3,7 @@ import {
   UnauthorizedException,
   BadRequestException,
   ConflictException,
+  NotFoundException,
 } from '@nestjs/common';
 import { v4 as uuidv4 } from 'uuid';
 import { PrismaService } from '../common/prisma/prisma.service';
@@ -11,7 +12,7 @@ import { JwtTokenService } from '../common/services/jwt-token.service';
 import { RedisService } from '../common/services/redis.service';
 import { SquadService } from '../common/services/squad.service';
 import { ActivityLogService } from '../common/services/activity-log.service';
-import { VerifyOtpDto, RefreshTokenDto } from './dto/auth.dto';
+import { VerifyOtpDto, RefreshTokenDto, OtpIntent } from './dto/auth.dto';
 // Use enum values as strings to avoid relying on generated prisma client exports
 
 @Injectable()
@@ -33,8 +34,25 @@ export class AuthService {
    * Request OTP via Termii
    * Rate limited: 3 requests per phone per 10 minutes
    */
-  async requestOtp(phone: string): Promise<any> {
+  async requestOtp(phone: string, intent: OtpIntent): Promise<any> {
     const normalizedPhone = this.normalizePhone(phone);
+
+    const existingUser = await (this.prisma as any).user.findUnique({
+      where: { phone: normalizedPhone },
+      select: { id: true },
+    });
+
+    if (intent === OtpIntent.LOGIN && !existingUser) {
+      throw new BadRequestException(
+        'No account for this phone number. Use signup to register.',
+      );
+    }
+
+    if (intent === OtpIntent.SIGNUP && existingUser) {
+      throw new BadRequestException(
+        'This phone is already registered. Use login to sign in.',
+      );
+    }
 
     // Rate limit check
     const rateLimitKey = `otp_rate:${normalizedPhone}`;
@@ -82,12 +100,15 @@ export class AuthService {
    */
   async verifyOtp(data: VerifyOtpDto): Promise<any> {
     const {
+      intent,
       phone,
       otp,
       first_name,
       last_name,
       email,
       avatar_url,
+      bvn,
+      dob,
     } = data;
     const normalizedPhone = this.normalizePhone(phone);
 
@@ -115,8 +136,13 @@ export class AuthService {
       include: { wallet: true },
     });
 
-    if (existingUser) {
-      // Returning login - just log and return tokens
+    if (intent === OtpIntent.LOGIN) {
+      if (!existingUser) {
+        throw new NotFoundException(
+          'No account for this phone number. Sign up first.',
+        );
+      }
+
       const accessToken = this.jwtService.generateAccessToken(
         existingUser.id,
         existingUser.phone,
@@ -141,13 +167,20 @@ export class AuthService {
       };
     }
 
-    if (!first_name || !last_name) {
-      throw new BadRequestException(
-        'first_name and last_name are required for first login',
+    // SIGNUP
+    if (existingUser) {
+      throw new ConflictException(
+        'This phone is already registered. Log in instead.',
       );
     }
 
-    // First login - atomic transaction
+    if (!first_name || !last_name || !bvn || !dob) {
+      throw new BadRequestException(
+        'first_name, last_name, bvn, and dob are required for signup',
+      );
+    }
+
+    // First-time registration — atomic transaction
     try {
       const user = await (this.prisma as any).$transaction(async (tx: any) => {
         // 1. Create user
@@ -161,13 +194,14 @@ export class AuthService {
           },
         });
 
-        // 2. Create Squad VA
+        // 2. Create Squad VA (Squad validates BVN vs name, DOB, phone — no separate BVN-only API in docs)
         const squadAccount = await this.squadService.createVirtualAccount(
           newUser.id,
           first_name,
           last_name,
           normalizedPhone,
           email,
+          { bvn, dob },
         );
 
         // 3. Update user with Squad details
@@ -176,6 +210,7 @@ export class AuthService {
           data: {
             squad_virtual_account: squadAccount.virtual_account_number,
             squad_bank_code: squadAccount.bank_code,
+            kyc_verified: true,
           },
           include: { wallet: true },
         });
@@ -196,6 +231,9 @@ export class AuthService {
       // Log successful login
       await this.activityLog.log(user.id, 'LOGIN_SUCCESS', {
         squad_virtual_account: user.squad_virtual_account,
+      });
+      await this.activityLog.log(user.id, 'KYC_BVN_VERIFIED', {
+        source: 'signup_virtual_account',
       });
 
       // Generate tokens

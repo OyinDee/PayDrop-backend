@@ -1,5 +1,24 @@
 import { ApiProperty } from '@nestjs/swagger';
-import { IsString, IsOptional, IsEmail } from 'class-validator';
+import { IsString, IsOptional, IsEmail, IsNotEmpty, Matches } from 'class-validator';
+
+export class VerifyKycDto {
+  @ApiProperty({
+    description:
+      '11-digit BVN. Squad sandbox examples use 22110011001; name, DOB, and phone on the user must match the BVN per Squad validation.',
+    example: '22110011001',
+  })
+  @IsNotEmpty()
+  @Matches(/^\d{11}$/, { message: 'bvn must be 11 digits' })
+  bvn: string;
+
+  @ApiProperty({
+    description: 'Date of birth (mm/dd/yyyy, dd/mm/yyyy, or yyyy-mm-dd). Must match BVN.',
+    example: '10/30/1990',
+  })
+  @IsNotEmpty()
+  @IsString()
+  dob: string;
+}
 
 export class UpdateProfileDto {
   @ApiProperty({

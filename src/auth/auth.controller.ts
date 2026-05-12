@@ -39,14 +39,14 @@ export class AuthController {
   @ApiResponse({ status: 400, description: 'Invalid phone or rate limited' })
   @ApiResponse({ status: 429, description: 'Too many requests' })
   async requestOtp(@Body() body: RequestOtpDto): Promise<OtpResponseDto> {
-    return await this.authService.requestOtp(body.phone);
+    return await this.authService.requestOtp(body.phone, body.intent);
   }
 
   @Post('verify-otp')
   @ApiOperation({
-    summary: 'Verify OTP & Login',
+    summary: 'Verify OTP — login or signup',
     description:
-      'Verify OTP code. On first login: creates user + Squad VA + wallet atomically.',
+      'Requires intent matching request-otp. login: existing users only. signup: creates user + Squad VA (BVN validated by Squad) + wallet; requires first_name, last_name, bvn, dob.',
   })
   @ApiBody({ type: VerifyOtpDto })
   @ApiResponse({

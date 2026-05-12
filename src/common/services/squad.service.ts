@@ -1,5 +1,6 @@
 import { Injectable, BadRequestException } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
+import { randomUUID } from 'crypto';
 import axios, { AxiosInstance } from 'axios';
 
 @Injectable()
@@ -7,6 +8,7 @@ export class SquadService {
   private client: AxiosInstance;
   private secretKey: string | undefined;
   private webhookSecret: string | undefined;
+  private merchantId: string | undefined;
   private testBvn: string | undefined;
   private testDob: string | undefined;
   private beneficiaryAccount: string | undefined;
@@ -15,6 +17,7 @@ export class SquadService {
   constructor(private configService: ConfigService) {
     this.secretKey = this.configService.get<string>('SQUAD_SECRET_KEY');
     this.webhookSecret = this.configService.get<string>('SQUAD_WEBHOOK_SECRET');
+    this.merchantId = this.configService.get<string>('SQUAD_MERCHANT_ID');
     this.testBvn = this.configService.get<string>('SQUAD_TEST_BVN') || '22110011001';
     this.testDob = normalizeDobToMmDdYyyy(
       this.configService.get<string>('SQUAD_TEST_DOB') || '10/30/1990',
@@ -43,7 +46,10 @@ export class SquadService {
   }
 
   /**
-   * Create virtual account for user on first signup
+   * Squad validates BVN against first_name, last_name, dob, and phone when creating
+   * individual virtual accounts — there is no separate documented “BVN-only” API.
+   * Sandbox docs commonly show test BVN `22110011001` with matching identity fields.
+   * Defaults come from SQUAD_TEST_BVN / SQUAD_TEST_DOB when signup omits explicit identity.
    */
   async createVirtualAccount(
     userId: string,
@@ -51,11 +57,17 @@ export class SquadService {
     lastName: string,
     phone: string,
     email?: string,
+    identity?: { bvn: string; dob: string },
   ): Promise<{ virtual_account_number: string; bank_code: string }> {
     try {
       if (!this.beneficiaryAccount) {
         throw new Error('SQUAD_BENEFICIARY_ACCOUNT is not configured');
       }
+
+      const bvn = identity?.bvn?.trim() || this.testBvn;
+      const dob = identity?.dob
+        ? normalizeDobToMmDdYyyy(identity.dob)
+        : this.testDob;
 
       const response = await this.client.post('/virtual-account', {
         customer_identifier: userId,
@@ -63,8 +75,8 @@ export class SquadService {
         last_name: lastName,
         mobile_num: phone,
         email: email || 'noemail@paydrop.ng',
-        bvn: this.testBvn,
-        dob: this.testDob,
+        bvn,
+        dob,
         beneficiary_account: this.beneficiaryAccount,
         gender: '1',
         address: '22 Test Street, Lagos',
@@ -92,14 +104,15 @@ export class SquadService {
   }
 
   /**
-   * Lookup account details before transfer
+   * NIP account lookup before payout (Squad Transfer / Payout API).
+   * @see https://docs.squadco.com/Transfer-API/transfer-apis
    */
   async lookupAccount(
     bankCode: string,
     accountNumber: string,
   ): Promise<{ account_name: string; bank_code: string }> {
     try {
-      const response = await this.client.post('/account/lookup', {
+      const response = await this.client.post('/payout/account/lookup', {
         bank_code: bankCode,
         account_number: accountNumber,
       });
@@ -108,9 +121,10 @@ export class SquadService {
         throw new Error('Account not found');
       }
 
+      const d = response.data.data as Record<string, unknown>;
       return {
-        account_name: response.data.data.account_name,
-        bank_code: response.data.data.bank_code,
+        account_name: String(d.account_name ?? ''),
+        bank_code: String(d.bank_code ?? bankCode),
       };
     } catch (error) {
       const msg = getAxiosErrorMessage(error);
@@ -126,7 +140,9 @@ export class SquadService {
   }
 
   /**
-   * Initiate transfer to external bank (withdrawal)
+   * Payout from Squad ledger to a bank account (after lookup).
+   * Amount is in kobo; API expects a string in kobo per Squad docs.
+   * transaction_reference must be prefixed with your Squad merchant ID (SQUAD_MERCHANT_ID).
    */
   async initiateTransfer(
     amount: number, // kobo
@@ -136,24 +152,42 @@ export class SquadService {
     narration?: string,
   ): Promise<{ transaction_ref: string; status: string }> {
     try {
-      // Convert kobo to naira for Squad API
-      const amountNaira = Math.floor(amount / 100);
+      if (!this.merchantId?.trim()) {
+        throw new Error(
+          'SQUAD_MERCHANT_ID is required for payout transfers (prefix for transaction_reference)',
+        );
+      }
 
-      const response = await this.client.post('/transfer', {
-        amount: amountNaira,
+      const transactionReference = `${this.merchantId.trim()}_pd_${randomUUID()}`;
+      const remark = (narration || 'PayDrop Transfer').slice(0, 120);
+
+      const response = await this.client.post('/payout/transfer', {
+        transaction_reference: transactionReference,
+        amount: String(Math.floor(amount)),
         bank_code: bankCode,
         account_number: accountNumber,
         account_name: accountName,
-        narration: narration || 'PayDrop Transfer',
+        currency_id: 'NGN',
+        remark,
       });
 
       if (response.status !== 200 || !response.data?.data) {
         throw new Error('Transfer initiation failed');
       }
 
+      const data = response.data.data as Record<string, unknown>;
+      const ref =
+        (typeof data.transaction_reference === 'string' && data.transaction_reference) ||
+        (typeof data.transaction_ref === 'string' && data.transaction_ref) ||
+        transactionReference;
+      const status =
+        (typeof data.status === 'string' && data.status) ||
+        (typeof data.response_description === 'string' && data.response_description) ||
+        'pending';
+
       return {
-        transaction_ref: response.data.data.transaction_ref,
-        status: response.data.data.status,
+        transaction_ref: ref,
+        status,
       };
     } catch (error) {
       const msg = getAxiosErrorMessage(error);

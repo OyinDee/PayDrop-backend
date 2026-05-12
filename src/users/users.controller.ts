@@ -8,7 +8,7 @@ import {
   ApiHeader,
 } from '@nestjs/swagger';
 import { UsersService } from './users.service';
-import { UpdateProfileDto } from './dto/user.dto';
+import { UpdateProfileDto, VerifyKycDto } from './dto/user.dto';
 import { JwtAuthGuard } from '../common/guards/jwt-auth.guard';
 import { CurrentUser } from '../common/decorators/current-user.decorator';
 
@@ -56,6 +56,24 @@ export class UsersController {
     @Body() body: UpdateProfileDto,
   ): Promise<any> {
     return await this.usersService.updateProfile(userId, body);
+  }
+
+  @Patch('me/kyc')
+  @UseGuards(JwtAuthGuard)
+  @ApiBearerAuth()
+  @ApiOperation({
+    summary: 'Verify KYC (BVN)',
+    description:
+      'Provisions Squad virtual account if missing; Squad validates BVN against name, DOB, and phone. Sandbox: use matching test BVN/identity per Squad docs (e.g. 22110011001).',
+  })
+  @ApiResponse({ status: 200, description: 'KYC updated' })
+  @ApiResponse({ status: 400, description: 'Squad validation failed' })
+  @ApiResponse({ status: 401, description: 'Unauthorized' })
+  async verifyKyc(
+    @CurrentUser('sub') userId: string,
+    @Body() body: VerifyKycDto,
+  ): Promise<any> {
+    return await this.usersService.verifyKyc(userId, body);
   }
 
   @Get(':id')

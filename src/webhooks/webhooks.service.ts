@@ -29,9 +29,11 @@ export class WebhooksService {
 
     const squadRef =
       body?.transaction_ref ||
+      body?.transaction_reference ||
       body?.transactionRef ||
       body?.reference ||
       body?.data?.transaction_ref ||
+      body?.data?.transaction_reference ||
       body?.data?.reference;
 
     if (!squadRef) {

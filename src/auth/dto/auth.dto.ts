@@ -5,9 +5,28 @@ import {
   IsOptional,
   IsUrl,
   IsEmail,
+  IsEnum,
+  IsNotEmpty,
+  Matches,
+  ValidateIf,
 } from 'class-validator';
 
+/** Must match request-otp intent: login only if user exists; signup only if user does not exist. */
+export enum OtpIntent {
+  LOGIN = 'login',
+  SIGNUP = 'signup',
+}
+
 export class RequestOtpDto {
+  @ApiProperty({
+    description:
+      'login: OTP for existing users only. signup: OTP for new registration only (phone must not already be registered).',
+    enum: OtpIntent,
+    example: OtpIntent.LOGIN,
+  })
+  @IsEnum(OtpIntent)
+  intent: OtpIntent;
+
   @ApiProperty({
     description: 'Nigerian phone number (e.g. 08012345678)',
     example: '08012345678',
@@ -18,6 +37,15 @@ export class RequestOtpDto {
 }
 
 export class VerifyOtpDto {
+  @ApiProperty({
+    description:
+      'Must match the intent used in request-otp. login: existing user only. signup: new user only; requires identity + BVN fields.',
+    enum: OtpIntent,
+    example: OtpIntent.LOGIN,
+  })
+  @IsEnum(OtpIntent)
+  intent: OtpIntent;
+
   @ApiProperty({
     description: 'Nigerian phone number',
     example: '08012345678',
@@ -34,25 +62,49 @@ export class VerifyOtpDto {
   otp: string;
 
   @ApiProperty({
-    description: 'First name (required for first login only)',
+    description: 'First name (required for signup only)',
     example: 'Oyindamola',
     required: false,
   })
-  @IsOptional()
+  @ValidateIf((o) => o.intent === OtpIntent.SIGNUP)
+  @IsNotEmpty({ message: 'first_name is required for signup' })
   @IsString()
   first_name?: string;
 
   @ApiProperty({
-    description: 'Last name (required for first login only)',
+    description: 'Last name (required for signup only)',
     example: 'Ajala',
     required: false,
   })
-  @IsOptional()
+  @ValidateIf((o) => o.intent === OtpIntent.SIGNUP)
+  @IsNotEmpty({ message: 'last_name is required for signup' })
   @IsString()
   last_name?: string;
 
   @ApiProperty({
-    description: 'Email address (optional)',
+    description:
+      '11-digit BVN (required for signup). Squad sandbox docs often use test BVN 22110011001; names, DOB, and phone must match what Squad expects for that BVN.',
+    example: '22110011001',
+    required: false,
+  })
+  @ValidateIf((o) => o.intent === OtpIntent.SIGNUP)
+  @IsNotEmpty({ message: 'bvn is required for signup' })
+  @Matches(/^\d{11}$/, { message: 'bvn must be 11 digits' })
+  bvn?: string;
+
+  @ApiProperty({
+    description:
+      'Date of birth (required for signup). Use mm/dd/yyyy, dd/mm/yyyy, or yyyy-mm-dd — normalized for Squad. Must match BVN on Squad side.',
+    example: '10/30/1990',
+    required: false,
+  })
+  @ValidateIf((o) => o.intent === OtpIntent.SIGNUP)
+  @IsNotEmpty({ message: 'dob is required for signup' })
+  @IsString()
+  dob?: string;
+
+  @ApiProperty({
+    description: 'Email address (optional; used on signup when provided)',
     example: 'oyindamola@example.com',
     required: false,
   })
@@ -61,7 +113,7 @@ export class VerifyOtpDto {
   email?: string;
 
   @ApiProperty({
-    description: 'Avatar URL (optional)',
+    description: 'Avatar URL (optional; used on signup when provided)',
     example: 'https://example.com/avatar.jpg',
     required: false,
   })
