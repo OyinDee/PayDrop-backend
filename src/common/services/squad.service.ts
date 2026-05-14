@@ -121,7 +121,7 @@ export class SquadService {
         throw new Error('SQUAD_BENEFICIARY_ACCOUNT is not configured');
       }
 
-      const bvn = identity?.bvn?.trim() || this.testBvn;
+      const bvn = identity?.bvn?.trim() || this.testBvn;  
       const dob = identity?.dob
         ? normalizeDobToMmDdYyyy(identity.dob)
         : this.testDob;

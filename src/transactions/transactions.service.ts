@@ -11,6 +11,7 @@ import { RedisService } from '../common/services/redis.service';
 import { FraudService } from '../common/services/fraud.service';
 import { SquadService } from '../common/services/squad.service';
 import { ActivityLogService } from '../common/services/activity-log.service';
+import { normalizeNgPhone } from '../common/utils/phone.util';
 
 @Injectable()
 export class TransactionsService {
@@ -24,6 +25,126 @@ export class TransactionsService {
     private readonly squad: SquadService,
     private readonly activityLog: ActivityLogService,
   ) {}
+
+  private recipientNipCode(
+    recipient: { squad_bank_code: string | null },
+    nipCode?: string,
+  ): string {
+    return (nipCode || recipient.squad_bank_code || '').trim();
+  }
+
+  /**
+   * Squad NIP account lookup for a PayDrop user's virtual account (payout rail).
+   */
+  private async squadLookupRecipient(
+    recipient: {
+      first_name: string;
+      last_name: string;
+      squad_virtual_account: string | null;
+      squad_bank_code: string | null;
+    },
+    nipCode?: string,
+  ) {
+    if (!recipient.squad_virtual_account) {
+      throw new BadRequestException('Recipient cannot receive transfers yet');
+    }
+    const nip = this.recipientNipCode(recipient, nipCode);
+    const lookup = await this.squad.lookupAccount(
+      nip,
+      recipient.squad_virtual_account,
+    );
+    const recipientName = `${recipient.first_name} ${recipient.last_name}`.trim();
+    const nameMatches =
+      !lookup.account_name ||
+      lookup.account_name.toLowerCase() === recipientName.toLowerCase();
+    return { lookup, recipientName, nameMatches, nip };
+  }
+
+  async lookupRecipientSquadPayoutAccount(recipientId: string, nipCode?: string) {
+    const recipient = await this.prisma.user.findUnique({
+      where: { id: recipientId },
+    });
+    if (!recipient) {
+      throw new NotFoundException('Recipient not found');
+    }
+    const { lookup, recipientName, nameMatches, nip } =
+      await this.squadLookupRecipient(recipient, nipCode);
+    return {
+      recipient_id: recipientId,
+      nip_code: lookup.nip_code || nip,
+      squad_virtual_account: recipient.squad_virtual_account,
+      account_name: lookup.account_name,
+      registered_name: recipientName,
+      name_matches_registered: nameMatches,
+    };
+  }
+
+  /**
+   * How many of the requester's address-book contacts (by phone) use PayDrop,
+   * and how many distinct contacts have completed a prior transfer to the recipient.
+   */
+  async recipientContactTransferInsight(
+    requesterUserId: string,
+    recipientId: string,
+    contactPhones: string[],
+  ) {
+    if (recipientId === requesterUserId) {
+      throw new BadRequestException('Cannot use yourself as transfer recipient');
+    }
+
+    const recipient = await this.prisma.user.findUnique({
+      where: { id: recipientId },
+      select: { id: true },
+    });
+    if (!recipient) {
+      throw new NotFoundException('Recipient not found');
+    }
+
+    const normalizedUnique = [
+      ...new Set(
+        contactPhones
+          .map((p) => (typeof p === 'string' ? p.trim() : ''))
+          .filter((p) => p.length > 0)
+          .map((p) => normalizeNgPhone(p)),
+      ),
+    ];
+
+    if (normalizedUnique.length === 0) {
+      throw new BadRequestException('contacts must include at least one valid phone');
+    }
+
+    const matchedUsers = await this.prisma.user.findMany({
+      where: { phone: { in: normalizedUnique } },
+      select: { id: true, phone: true },
+    });
+
+    const matchedIds = [...new Set(matchedUsers.map((u: { id: string }) => u.id))];
+    const friendCandidateIds = matchedIds.filter(
+      (id) => id !== requesterUserId && id !== recipientId,
+    );
+
+    let friendsWhoTransferred = 0;
+    if (friendCandidateIds.length > 0) {
+      const grouped = await this.prisma.transaction.groupBy({
+        by: ['sender_id'],
+        where: {
+          recipient_id: recipientId,
+          type: 'TRANSFER',
+          status: 'COMPLETED',
+          sender_id: { in: friendCandidateIds },
+        },
+      });
+      friendsWhoTransferred = grouped.length;
+    }
+
+    return {
+      recipient_id: recipientId,
+      contacts_submitted: contactPhones.length,
+      distinct_phones_normalized: normalizedUnique.length,
+      contacts_matched_on_paydrop: matchedIds.length,
+      friends_who_transferred_to_recipient: friendsWhoTransferred,
+    };
+  }
 
   async transfer(
     senderId: string,
@@ -173,31 +294,16 @@ export class TransactionsService {
         throw new BadRequestException('Insufficient funds');
       }
 
-      // Verify recipient has Squad details
-      if (!recipient.squad_virtual_account) {
-        throw new BadRequestException('Recipient cannot receive transfers yet');
-      }
-
-      const recipientNipCode = (nipCode || recipient.squad_bank_code || '').trim();
-
-      // Optional: verify recipient name (contract says account lookup)
-      // We do a best-effort lookup; if it fails, we still stop (safer).
-      const lookup = await this.squad.lookupAccount(
-        recipientNipCode,  // NIP code (6 chars)
-        recipient.squad_virtual_account,
-      );
-      const recipientName = `${recipient.first_name} ${recipient.last_name}`.trim();
-      if (
-        lookup.account_name &&
-        lookup.account_name.toLowerCase() !== recipientName.toLowerCase()
-      ) {
+      const { lookup, recipientName, nameMatches, nip } =
+        await this.squadLookupRecipient(recipient, nipCode);
+      if (!nameMatches) {
         throw new BadRequestException('Recipient account name mismatch');
       }
 
       const squadTransfer = await this.squad.initiateTransfer(
         Number(amountKobo),
-        recipientNipCode,  // NIP code (6 chars)
-        recipient.squad_virtual_account,
+        nip,
+        recipient.squad_virtual_account!,
         lookup.account_name || recipientName,
         'PayDrop P2P Transfer',
       );
@@ -263,11 +369,12 @@ export class TransactionsService {
     // Re-run ALLOW path initiation (same logic as transfer allow, but use existing tx row + idempotency_key)
     const recipient = await this.prisma.user.findUnique({ where: { id: tx.recipient_id || '' } });
     if (!recipient) throw new NotFoundException('Recipient not found');
-    if (!recipient.squad_virtual_account) {
-      throw new BadRequestException('Recipient cannot receive transfers yet');
-    }
 
-    const recipientNipCode = ((payload as any)?.nip_code || recipient.squad_bank_code || '').trim();
+    const nipOverride = (payload as any)?.nip_code;
+    const nipFromPayload =
+      typeof nipOverride === 'string' && nipOverride.trim().length > 0
+        ? nipOverride.trim()
+        : undefined;
 
     const initiated = (await this.prisma.$transaction(async (p: any) => {
       await p.$queryRaw`SELECT 1 FROM wallets WHERE user_id = ${senderId} FOR UPDATE`;
@@ -276,22 +383,16 @@ export class TransactionsService {
         throw new BadRequestException('Insufficient funds');
       }
 
-      const lookup = await this.squad.lookupAccount(
-        recipientNipCode,  // NIP code (6 chars)
-        recipient.squad_virtual_account,
-      );
-      const recipientName = `${recipient.first_name} ${recipient.last_name}`.trim();
-      if (
-        lookup.account_name &&
-        lookup.account_name.toLowerCase() !== recipientName.toLowerCase()
-      ) {
+      const { lookup, recipientName, nameMatches, nip } =
+        await this.squadLookupRecipient(recipient, nipFromPayload);
+      if (!nameMatches) {
         throw new BadRequestException('Recipient account name mismatch');
       }
 
       const squadTransfer = await this.squad.initiateTransfer(
         Number(tx.amount),
-        recipientNipCode,  // NIP code (6 chars)
-        recipient.squad_virtual_account,
+        nip,
+        recipient.squad_virtual_account!,
         lookup.account_name || recipientName,
         'PayDrop P2P Transfer',
       );

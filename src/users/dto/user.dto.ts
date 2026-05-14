@@ -79,6 +79,13 @@ export class UserProfileDto {
   @ApiProperty({ description: 'Phone number', example: '08012345678' })
   phone: string;
 
+  @ApiProperty({
+    description: 'Public username',
+    example: 'oyin_ajala',
+    nullable: true,
+  })
+  username: string | null;
+
   @ApiProperty({ description: 'First name', example: 'Oyindamola' })
   first_name: string;
 
@@ -93,7 +100,7 @@ export class UserProfileDto {
   email: string | null;
 
   @ApiProperty({
-    description: 'Avatar URL',
+    description: 'Avatar URL (custom image, or generated default if unset in DB)',
     nullable: true,
   })
   avatar_url: string | null;
@@ -126,6 +133,13 @@ export class PublicUserProfileDto {
   id: string;
 
   @ApiProperty({
+    description: 'Public username',
+    example: 'oyin_ajala',
+    nullable: true,
+  })
+  username: string | null;
+
+  @ApiProperty({
     description: 'First name',
     example: 'Oyindamola',
   })
@@ -138,7 +152,7 @@ export class PublicUserProfileDto {
   last_name: string;
 
   @ApiProperty({
-    description: 'Avatar URL',
+    description: 'Avatar URL (resolved default if unset)',
     nullable: true,
   })
   avatar_url: string | null;

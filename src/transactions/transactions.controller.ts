@@ -6,6 +6,8 @@ import { JwtAuthGuard } from '../common/guards/jwt-auth.guard';
 import {
   TransferDto,
   ConfirmTransferDto,
+  SquadAccountLookupDto,
+  RecipientContactTransferInsightDto,
   TransferAllowedDto,
   TransferFlaggedDto,
   TransferBlockedDto,
@@ -24,13 +26,53 @@ import {
 export class TransactionsController {
   constructor(private transactionsService: TransactionsService) {}
 
+  @Post('squad-account-lookup')
+  @UseGuards(JwtAuthGuard)
+  @ApiBearerAuth()
+  @ApiOperation({
+    summary: 'Squad NIP account lookup (recipient VA)',
+    description:
+      'Resolves the recipient’s Squad-linked bank account name via Squad payout account lookup, before calling POST /transactions/transfer.',
+  })
+  @ApiResponse({ status: 200, description: 'Lookup result' })
+  @ApiResponse({ status: 401, description: 'Unauthorized' })
+  async squadAccountLookup(
+    @Body() body: SquadAccountLookupDto,
+  ) {
+    return this.transactionsService.lookupRecipientSquadPayoutAccount(
+      body.recipient_id,
+      body.nip_code,
+    );
+  }
+
+  @Post('transfer/recipient-contact-insight')
+  @UseGuards(JwtAuthGuard)
+  @ApiBearerAuth()
+  @ApiOperation({
+    summary: 'Friends who paid this recipient',
+    description:
+      'Accepts the user’s contact phone numbers and returns how many of those contacts (PayDrop users) have completed a prior transfer to the chosen recipient — social proof before sending money.',
+  })
+  @ApiResponse({ status: 200, description: 'Insight counts' })
+  @ApiResponse({ status: 401, description: 'Unauthorized' })
+  async recipientContactInsight(
+    @CurrentUser('sub') requesterUserId: string,
+    @Body() body: RecipientContactTransferInsightDto,
+  ) {
+    return this.transactionsService.recipientContactTransferInsight(
+      requesterUserId,
+      body.recipient_id,
+      body.contacts,
+    );
+  }
+
   @Post('transfer')
   @UseGuards(JwtAuthGuard)
   @ApiBearerAuth()
   @ApiOperation({
     summary: 'Initiate Transfer',
     description:
-      'Initiate a transfer between PayDrop users. Performs fraud pre-scoring, looks up recipient bank details via POST /payout/account/lookup, then initiates payout via POST /payout/transfer if allowed by fraud engine. Returns COMPLETED for low-risk or PENDING_REVIEW for flagged transfers.',
+      'Initiate a transfer between PayDrop users. Performs fraud pre-scoring, verifies the recipient’s Squad virtual account via NIP lookup, then initiates payout. For a standalone NIP lookup (e.g. UI preview), use POST /transactions/squad-account-lookup.',
   })
   @ApiResponse({
     status: 200,

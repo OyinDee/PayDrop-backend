@@ -2,6 +2,7 @@ import { Injectable, BadRequestException } from '@nestjs/common';
 import { v4 as uuidv4 } from 'uuid';
 import { PrismaService } from '../common/prisma/prisma.service';
 import { RedisService } from '../common/services/redis.service';
+import { resolveUserAvatarUrl } from '../common/utils/avatar.util';
 
 @Injectable()
 export class DiscoverService {
@@ -56,6 +57,7 @@ export class DiscoverService {
       },
       select: {
         id: true,
+        username: true,
         first_name: true,
         last_name: true,
         avatar_url: true,
@@ -66,11 +68,12 @@ export class DiscoverService {
     const trustValues = await this.redis.mget<string>(trustKeys);
 
     return {
-      users: users.map((u: { id: string; first_name: string; last_name: string; avatar_url: string | null }, idx: number) => ({
+      users: users.map((u: { id: string; username: string | null; first_name: string; last_name: string; avatar_url: string | null }, idx: number) => ({
         id: u.id,
+        username: u.username ?? null,
         first_name: u.first_name,
         last_name: u.last_name,
-        avatar_url: u.avatar_url,
+        avatar_url: resolveUserAvatarUrl(u),
         trust_tier: trustValues[idx] || 'MEDIUM',
       })),
     };
@@ -106,6 +109,7 @@ export class DiscoverService {
       where: { id: userId },
       select: {
         id: true,
+        username: true,
         first_name: true,
         last_name: true,
         avatar_url: true,
@@ -122,9 +126,10 @@ export class DiscoverService {
     return {
       user: {
         id: user.id,
+        username: user.username ?? null,
         first_name: user.first_name,
         last_name: user.last_name,
-        avatar_url: user.avatar_url,
+        avatar_url: resolveUserAvatarUrl(user),
         trust_tier: trustTier,
       },
     };

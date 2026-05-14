@@ -1,5 +1,13 @@
 import { ApiProperty } from '@nestjs/swagger';
-import { IsString, IsNumber, IsOptional, IsUUID } from 'class-validator';
+import {
+  IsString,
+  IsNumber,
+  IsOptional,
+  IsUUID,
+  IsArray,
+  ArrayMinSize,
+  ArrayMaxSize,
+} from 'class-validator';
 
 export class TransferDto {
   @ApiProperty({
@@ -42,6 +50,46 @@ export class TransferDto {
   @IsOptional()
   @IsString()
   nip_code?: string;
+}
+
+export class SquadAccountLookupDto {
+  @ApiProperty({
+    description: 'Recipient PayDrop user ID',
+    example: '550e8400-e29b-41d4-a716-446655440000',
+  })
+  @IsString()
+  recipient_id: string;
+
+  @ApiProperty({
+    description:
+      'Optional NIP code override (Squad payout bank code). Defaults to the recipient’s stored bank code.',
+    example: '000013',
+    required: false,
+  })
+  @IsOptional()
+  @IsString()
+  nip_code?: string;
+}
+
+export class RecipientContactTransferInsightDto {
+  @ApiProperty({
+    description: 'PayDrop user you are about to pay',
+    example: '550e8400-e29b-41d4-a716-446655440000',
+  })
+  @IsString()
+  recipient_id: string;
+
+  @ApiProperty({
+    description:
+      'Phone numbers from the user’s address book (any common Nigerian formats; normalized server-side).',
+    example: ['08012345678', '+2348012345678'],
+    type: [String],
+  })
+  @IsArray()
+  @ArrayMinSize(1)
+  @ArrayMaxSize(5000)
+  @IsString({ each: true })
+  contacts: string[];
 }
 
 export class ConfirmTransferDto {

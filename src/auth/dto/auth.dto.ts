@@ -83,6 +83,20 @@ export class VerifyOtpDto {
 
   @ApiProperty({
     description:
+      'Unique handle, stored lowercase (required for signup). 3–24 characters: letters, numbers, underscore.',
+    example: 'oyin_ajala',
+    required: false,
+  })
+  @ValidateIf((o) => o.intent === OtpIntent.SIGNUP)
+  @IsNotEmpty({ message: 'username is required for signup' })
+  @IsString()
+  @Matches(/^[a-zA-Z0-9_]{3,24}$/, {
+    message: 'username must be 3–24 characters (letters, numbers, underscore)',
+  })
+  username?: string;
+
+  @ApiProperty({
+    description:
       '11-digit BVN (required for signup). Squad sandbox docs often use test BVN 22110011001; names, DOB, and phone must match what Squad expects for that BVN.',
     example: '22110011001',
     required: false,
@@ -113,7 +127,7 @@ export class VerifyOtpDto {
   email?: string;
 
   @ApiProperty({
-    description: 'Avatar URL (optional; used on signup when provided)',
+    description: 'Avatar URL (optional on signup; if omitted, a default image is generated)',
     example: 'https://example.com/avatar.jpg',
     required: false,
   })
@@ -146,6 +160,13 @@ export class UserDataDto {
   @ApiProperty({ description: 'Phone number', example: '08012345678' })
   phone: string;
 
+  @ApiProperty({
+    description: 'Public username (null for legacy accounts)',
+    example: 'oyin_ajala',
+    nullable: true,
+  })
+  username: string | null;
+
   @ApiProperty({ description: 'First name', example: 'Oyindamola' })
   first_name: string;
 
@@ -160,8 +181,8 @@ export class UserDataDto {
   email: string | null;
 
   @ApiProperty({
-    description: 'Avatar URL',
-    example: 'https://example.com/avatar.jpg',
+    description: 'Resolved avatar URL (custom or generated)',
+    example: 'https://api.dicebear.com/7.x/initials/svg?seed=oyin_ajala',
     nullable: true,
   })
   avatar_url: string | null;

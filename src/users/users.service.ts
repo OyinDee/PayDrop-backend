@@ -2,6 +2,7 @@ import { Injectable, NotFoundException } from '@nestjs/common';
 import { PrismaService } from '../common/prisma/prisma.service';
 import { ActivityLogService } from '../common/services/activity-log.service';
 import { SquadService } from '../common/services/squad.service';
+import { resolveUserAvatarUrl } from '../common/utils/avatar.util';
 
 @Injectable()
 export class UsersService {
@@ -27,10 +28,11 @@ export class UsersService {
     return {
       id: user.id,
       phone: user.phone,
+      username: user.username ?? null,
       first_name: user.first_name,
       last_name: user.last_name,
       email: user.email,
-      avatar_url: user.avatar_url,
+      avatar_url: resolveUserAvatarUrl(user),
       squad_virtual_account: user.squad_virtual_account,
       squad_bank_code: user.squad_bank_code,
       kyc_verified: user.kyc_verified,
@@ -161,10 +163,11 @@ export class UsersService {
     return {
       id: user.id,
       phone: user.phone,
+      username: user.username ?? null,
       first_name: user.first_name,
       last_name: user.last_name,
       email: user.email,
-      avatar_url: user.avatar_url,
+      avatar_url: resolveUserAvatarUrl(user),
       squad_virtual_account: user.squad_virtual_account,
       squad_bank_code: user.squad_bank_code,
       kyc_verified: user.kyc_verified,
@@ -190,9 +193,10 @@ export class UsersService {
 
     return {
       id: user.id,
+      username: user.username ?? null,
       first_name: user.first_name,
       last_name: user.last_name,
-      avatar_url: user.avatar_url,
+      avatar_url: resolveUserAvatarUrl(user),
       // trust_tier would be fetched from Redis cache (populated by fraud service)
     };
   }

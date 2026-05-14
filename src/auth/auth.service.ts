@@ -13,6 +13,8 @@ import { RedisService } from '../common/services/redis.service';
 import { SquadService } from '../common/services/squad.service';
 import { ActivityLogService } from '../common/services/activity-log.service';
 import { VerifyOtpDto, RefreshTokenDto, OtpIntent } from './dto/auth.dto';
+import { normalizeNgPhone } from '../common/utils/phone.util';
+import { buildDefaultAvatarUrl, resolveUserAvatarUrl } from '../common/utils/avatar.util';
 // Use enum values as strings to avoid relying on generated prisma client exports
 
 @Injectable()
@@ -35,7 +37,7 @@ export class AuthService {
    * Rate limited: 3 requests per phone per 10 minutes
    */
   async requestOtp(phone: string, intent: OtpIntent): Promise<any> {
-    const normalizedPhone = this.normalizePhone(phone);
+    const normalizedPhone = normalizeNgPhone(phone);
 
     const existingUser = await (this.prisma as any).user.findUnique({
       where: { phone: normalizedPhone },
@@ -107,10 +109,11 @@ export class AuthService {
       last_name,
       email,
       avatar_url,
+      username,
       bvn,
       dob,
     } = data;
-    const normalizedPhone = this.normalizePhone(phone);
+    const normalizedPhone = normalizeNgPhone(phone);
 
     // Verify OTP with Termii
     const otpVerification = await this.termiiService.verifyOtp(
@@ -174,11 +177,23 @@ export class AuthService {
       );
     }
 
-    if (!first_name || !last_name || !bvn || !dob) {
+    if (!first_name || !last_name || !bvn || !dob || !username) {
       throw new BadRequestException(
-        'first_name, last_name, bvn, and dob are required for signup',
+        'first_name, last_name, username, bvn, and dob are required for signup',
       );
     }
+
+    const normalizedUsername = username.trim().toLowerCase();
+    const usernameTaken = await this.prisma.user.findUnique({
+      where: { username: normalizedUsername },
+      select: { id: true },
+    });
+    if (usernameTaken) {
+      throw new ConflictException('Username is already taken');
+    }
+
+    const storedAvatarUrl =
+      avatar_url?.trim() || buildDefaultAvatarUrl(normalizedUsername);
 
     // First-time registration — atomic transaction
     try {
@@ -187,10 +202,11 @@ export class AuthService {
         const newUser = await tx.user.create({
           data: {
             phone: normalizedPhone,
+            username: normalizedUsername,
             first_name,
             last_name,
             email: email || null,
-            avatar_url: avatar_url || null,
+            avatar_url: storedAvatarUrl,
           },
         });
 
@@ -257,7 +273,14 @@ export class AuthService {
           currency: 'NGN',
         },
       };
-    } catch (error) {
+    } catch (error: any) {
+      if (error?.code === 'P2002') {
+        const target = error?.meta?.target;
+        const targets = Array.isArray(target) ? target : target ? [target] : [];
+        if (targets.includes('username')) {
+          throw new ConflictException('Username is already taken');
+        }
+      }
       const message = error instanceof Error ? error.message : 'Unknown error';
       throw new BadRequestException(
         'Signup failed: ' + message,
@@ -332,41 +355,17 @@ export class AuthService {
   }
 
   /**
-   * Normalize phone number to 234 format
-   */
-  private normalizePhone(phone: string): string {
-    let normalized = phone.replace(/\D/g, '');
-
-    // Already in 234 format
-    if (normalized.startsWith('234')) {
-      return normalized;
-    }
-
-    // 08xxxxx format
-    if (normalized.startsWith('0')) {
-      return '234' + normalized.slice(1);
-    }
-
-    // 8xxxxx format (missing leading 0)
-    if (normalized.length === 10) {
-      return '234' + normalized.slice(1);
-    }
-
-    // Fallback: prepend 234
-    return '234' + normalized;
-  }
-
-  /**
    * Format user response (no sensitive data)
    */
   private formatUserResponse(user: any): any {
     return {
       id: user.id,
       phone: user.phone,
+      username: user.username ?? null,
       first_name: user.first_name,
       last_name: user.last_name,
       email: user.email,
-      avatar_url: user.avatar_url,
+      avatar_url: resolveUserAvatarUrl(user),
       squad_virtual_account: user.squad_virtual_account,
       squad_bank_code: user.squad_bank_code,
       kyc_verified: user.kyc_verified,
