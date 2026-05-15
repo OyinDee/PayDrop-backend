@@ -1,4 +1,4 @@
-import { ApiProperty } from '@nestjs/swagger';
+import { ApiProperty, ApiPropertyOptional } from '@nestjs/swagger';
 import {
   IsString,
   IsNumber,
@@ -332,4 +332,24 @@ export class FraudDetailDto {
     type: FraudFeatures,
   })
   features: FraudFeatures;
+
+  @ApiPropertyOptional({
+    description:
+      'Where this payload came from. This GET endpoint does not call the fraud HTTP service.',
+    enum: ['fraud_event', 'transaction_snapshot'],
+    example: 'transaction_snapshot',
+  })
+  source?: string;
+
+  @ApiPropertyOptional({
+    description:
+      'When the score was produced (transfer creation), ISO-8601. Only for transaction_snapshot.',
+    example: '2026-05-15T22:11:14.461Z',
+  })
+  scored_at?: string;
+
+  @ApiPropertyOptional({
+    description: 'Short explanation of how to interpret this response',
+  })
+  note?: string;
 }

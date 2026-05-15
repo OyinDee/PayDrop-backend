@@ -320,6 +320,7 @@ export class TransactionsService {
     // Pre-check 2 — Balance (and pessimistic lock inside the transaction)
     // Pre-check 3 — Fraud score (fail open)
     const fraud = await this.fraud.scoreTransaction({
+      idempotency_key: idempotencyKey,
       sender_id: senderId,
       recipient_id: recipientId,
       amount: Number(amountKobo),
@@ -642,11 +643,20 @@ export class TransactionsService {
     });
 
     if (fraudEvent) {
+      this.logger.log(
+        JSON.stringify({
+          event: 'fraud_detail_served',
+          transaction_id: transactionId,
+          source: 'fraud_event',
+        }),
+      );
       return {
         score: fraudEvent.score,
         verdict: fraudEvent.verdict,
         reason: fraudEvent.reason,
         features: fraudEvent.features as Record<string, unknown>,
+        source: 'fraud_event',
+        note: 'Full row from fraud_events table (manual review / legacy flow).',
       };
     }
 
@@ -655,6 +665,15 @@ export class TransactionsService {
       transaction.verdict != null ||
       transaction.fraud_reason != null
     ) {
+      this.logger.log(
+        JSON.stringify({
+          event: 'fraud_detail_served',
+          transaction_id: transactionId,
+          source: 'transaction_snapshot',
+          reminder:
+            'GET /fraud-detail does not call FRAUD_SERVICE_URL. FraudService runs only when the transfer is created; check logs from that time for fraud_service_unavailable.',
+        }),
+      );
       return {
         score: transaction.fraud_score ?? 0,
         verdict: transaction.verdict ?? 'ALLOW',
@@ -662,6 +681,10 @@ export class TransactionsService {
           transaction.fraud_reason ??
           'Fraud verdict stored on transaction (external fraud microservice scores are not persisted as FraudEvent rows).',
         features: {} as Record<string, unknown>,
+        source: 'transaction_snapshot',
+        scored_at: transaction.created_at.toISOString(),
+        note:
+          'Snapshot from when this transfer was scored (POST /transactions/transfer).',
       };
     }
 

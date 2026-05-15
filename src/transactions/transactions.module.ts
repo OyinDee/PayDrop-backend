@@ -1,7 +1,6 @@
 import { Module } from '@nestjs/common';
 import { TransactionsController } from './transactions.controller';
 import { TransactionsService } from './transactions.service';
-import { PrismaService } from '../common/prisma/prisma.service';
 import { RedisService } from '../common/services/redis.service';
 import { FraudService } from '../common/services/fraud.service';
 import { SquadService } from '../common/services/squad.service';
@@ -14,7 +13,6 @@ import { WalletModule } from '../wallet/wallet.module';
   controllers: [TransactionsController],
   providers: [
     TransactionsService,
-    PrismaService,
     RedisService,
     FraudService,
     SquadService,

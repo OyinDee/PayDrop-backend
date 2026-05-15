@@ -3,6 +3,8 @@ import { ConfigService } from '@nestjs/config';
 import axios, { AxiosInstance } from 'axios';
 
 interface FraudScoreRequest {
+  /** Required by paydrop-model / FastAPI scorer; aligns with this transfer attempt's idempotency key. */
+  idempotency_key: string;
   sender_id: string;
   recipient_id: string;
   amount: number; // kobo
@@ -21,7 +23,8 @@ interface FraudScoreResponse {
 @Injectable()
 export class FraudService {
   private client: AxiosInstance;
-  private fraudServiceUrl: string;
+  private readonly fraudServiceUrl: string;
+  private readonly scorePath = '/score';
   private readonly logger = new Logger(FraudService.name);
   private readonly timeout = 3000; // 3 seconds
 
@@ -36,6 +39,30 @@ export class FraudService {
     });
   }
 
+  private scoreEndpoint(): string {
+    const base = this.fraudServiceUrl.replace(/\/$/, '');
+    return `${base}${this.scorePath}`;
+  }
+
+  private logFraudUnavailable(
+    kind: string,
+    meta: Record<string, unknown>,
+  ): void {
+    this.logger.warn(
+      JSON.stringify({
+        event: 'fraud_service_unavailable',
+        kind,
+        env_fraud_service_url: this.fraudServiceUrl,
+        request_method: 'POST',
+        request_path: this.scorePath,
+        request_url: this.scoreEndpoint(),
+        timeout_ms: this.timeout,
+        hint: 'Set FRAUD_SERVICE_URL to your fraud API base (e.g. https://fraud.internal), or run the local scorer on that host. Fail-open returns ALLOW with score 20.',
+        ...meta,
+      }),
+    );
+  }
+
   /**
    * Score transaction for fraud risk
    * Timeout: 3 seconds. If service DOWN or timeout, returns ALLOW (fail open)
@@ -45,7 +72,7 @@ export class FraudService {
   ): Promise<FraudScoreResponse> {
     try {
       const response = await this.client.post<FraudScoreResponse>(
-        '/score',
+        this.scorePath,
         data,
       );
 
@@ -53,21 +80,40 @@ export class FraudService {
         return response.data;
       }
 
-      // Invalid response, default to allow
-      this.logger.warn('Invalid fraud score response, defaulting to ALLOW');
+      this.logFraudUnavailable('invalid_http_response', {
+        http_status: response.status,
+        body_preview:
+          typeof response.data === 'object'
+            ? JSON.stringify(response.data).slice(0, 500)
+            : String(response.data).slice(0, 200),
+      });
       return this.getDefaultResponse('ALLOW');
     } catch (error) {
-      // Timeout or service down - fail open
       if (axios.isAxiosError(error)) {
-        if (error.code === 'ECONNABORTED') {
-          this.logger.warn('Fraud service timeout, defaulting to ALLOW');
-        } else {
-          this.logger.warn(
-            `Fraud service error (${error.code}), defaulting to ALLOW`,
-          );
-        }
+        const kind = (() => {
+          if (error.code === 'ECONNABORTED') return 'timeout';
+          if (error.code === 'ECONNREFUSED') return 'connection_refused';
+          const st = error.response?.status;
+          if (st != null && st >= 400 && st < 500) return 'upstream_client_error';
+          return 'axios_error';
+        })();
+
+        this.logFraudUnavailable(kind, {
+          axios_code: error.code,
+          axios_message: error.message,
+          syscall: (error as NodeJS.ErrnoException)?.syscall,
+          errno: (error as NodeJS.ErrnoException)?.errno,
+          response_status: error.response?.status,
+          response_data:
+            error.response?.data != null
+              ? JSON.stringify(error.response.data).slice(0, 500)
+              : undefined,
+        });
       } else {
-        this.logger.warn('Unexpected fraud service error, defaulting to ALLOW');
+        this.logFraudUnavailable('non_axios_error', {
+          error:
+            error instanceof Error ? error.message : String(error),
+        });
       }
 
       return this.getDefaultResponse('ALLOW');

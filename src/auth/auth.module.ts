@@ -3,7 +3,6 @@ import { JwtModule } from '@nestjs/jwt';
 import { ConfigModule, ConfigService } from '@nestjs/config';
 import { AuthService } from './auth.service';
 import { AuthController } from './auth.controller';
-import { PrismaService } from '../common/prisma/prisma.service';
 import { TermiiService } from '../common/services/termii.service';
 import { JwtTokenService } from '../common/services/jwt-token.service';
 import { RedisService } from '../common/services/redis.service';
@@ -24,7 +23,6 @@ import { ActivityLogService } from '../common/services/activity-log.service';
   controllers: [AuthController],
   providers: [
     AuthService,
-    PrismaService,
     TermiiService,
     JwtTokenService,
     RedisService,
