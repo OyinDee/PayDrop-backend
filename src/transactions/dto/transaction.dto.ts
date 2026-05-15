@@ -25,14 +25,6 @@ export class TransferDto {
   amount: number;
 
   @ApiProperty({
-    description: 'Idempotency key (UUID per attempt to prevent duplicate transfers)',
-    example: '550e8400-e29b-41d4-a716-446655440000',
-  })
-  @IsString()
-  @IsUUID()
-  idempotency_key: string;
-
-  @ApiProperty({
     description: 'Optional payment note',
     example: 'Payment for goods',
     required: false,
@@ -43,13 +35,22 @@ export class TransferDto {
 
   @ApiProperty({
     description:
-      'Optional NIP code override (Squad payout bank code). For sandbox, PayDrop will default to the GT/Squad sandbox NIP code if missing/invalid.',
+      'Optional NIP code override. Defaults to GTBank 000013 for PayDrop-to-PayDrop transfers (recipient virtual account).',
     example: '000013',
     required: false,
   })
   @IsOptional()
   @IsString()
   nip_code?: string;
+}
+
+export class SquadTransferRequeryDto {
+  @ApiProperty({
+    description: 'PayDrop transaction ID with an existing squad_ref',
+    example: '550e8400-e29b-41d4-a716-446655440000',
+  })
+  @IsString()
+  transaction_id: string;
 }
 
 export class SquadAccountLookupDto {
@@ -59,16 +60,6 @@ export class SquadAccountLookupDto {
   })
   @IsString()
   recipient_id: string;
-
-  @ApiProperty({
-    description:
-      'Optional NIP code override (Squad payout bank code). Defaults to the recipient’s stored bank code.',
-    example: '000013',
-    required: false,
-  })
-  @IsOptional()
-  @IsString()
-  nip_code?: string;
 }
 
 export class RecipientContactTransferInsightDto {
@@ -170,6 +161,12 @@ export class TransferAllowedDto {
 }
 
 export class TransferFlaggedDto {
+  @ApiProperty({
+    description: 'Server-generated idempotency key for this transfer attempt',
+    example: '550e8400-e29b-41d4-a716-446655440000',
+  })
+  idempotency_key: string;
+
   @ApiProperty({
     description: 'Transaction ID',
     example: 'cuid123',

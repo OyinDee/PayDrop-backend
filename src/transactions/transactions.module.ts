@@ -7,9 +7,10 @@ import { FraudService } from '../common/services/fraud.service';
 import { SquadService } from '../common/services/squad.service';
 import { ActivityLogService } from '../common/services/activity-log.service';
 import { AuthModule } from '../auth/auth.module';
+import { WalletModule } from '../wallet/wallet.module';
 
 @Module({
-  imports: [AuthModule],
+  imports: [AuthModule, WalletModule],
   controllers: [TransactionsController],
   providers: [
     TransactionsService,

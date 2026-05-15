@@ -110,41 +110,39 @@ export class WebhooksService {
     }
 
     if (tx.type === 'TRANSFER') {
+      let shouldDedupe = false;
+
       if (isSuccess) {
-        await this.prisma.$transaction(async (p: any) => {
-          await p.transaction.update({
+        const applied = await this.wallet.completePendingP2pTransfer(tx.id);
+        if (applied) {
+          shouldDedupe = true;
+        } else {
+          const cur = await this.prisma.transaction.findUnique({
             where: { id: tx.id },
-            data: { status: 'COMPLETED' },
+            select: { status: true },
           });
-          if (tx.sender_id) {
-            await p.wallet.update({
-              where: { user_id: tx.sender_id },
-              data: { balance: { decrement: tx.amount } },
-            });
+          if (cur?.status === 'COMPLETED') {
+            shouldDedupe = true;
           }
-          if (tx.recipient_id) {
-            await p.wallet.update({
-              where: { user_id: tx.recipient_id },
-              data: { balance: { increment: tx.amount } },
-            });
-          }
-        });
-        await this.activityLog.log(tx.sender_id || '', 'TRANSFER_COMPLETED', {
-          transaction_id: tx.id,
-          squad_ref: squadRef,
-          amount: Number(tx.amount),
-        });
+        }
       } else if (isFailed) {
-        await this.prisma.transaction.update({
-          where: { id: tx.id },
-          data: { status: 'FAILED' },
-        });
-        await this.activityLog.log(tx.sender_id || '', 'TRANSFER_FAILED', {
-          transaction_id: tx.id,
-          squad_ref: squadRef,
-        });
+        const applied = await this.wallet.failPendingP2pTransfer(tx.id);
+        if (applied) {
+          shouldDedupe = true;
+        } else {
+          const cur = await this.prisma.transaction.findUnique({
+            where: { id: tx.id },
+            select: { status: true },
+          });
+          if (cur?.status === 'FAILED') {
+            shouldDedupe = true;
+          }
+        }
       }
-      await this.redis.set(dedupeKey, true, 86400);
+
+      if (shouldDedupe) {
+        await this.redis.set(dedupeKey, true, 86400);
+      }
       return { success: true };
     }
 

@@ -7,6 +7,7 @@ import {
   TransferDto,
   ConfirmTransferDto,
   SquadAccountLookupDto,
+  SquadTransferRequeryDto,
   RecipientContactTransferInsightDto,
   TransferAllowedDto,
   TransferFlaggedDto,
@@ -30,9 +31,9 @@ export class TransactionsController {
   @UseGuards(JwtAuthGuard)
   @ApiBearerAuth()
   @ApiOperation({
-    summary: 'Squad NIP account lookup (recipient VA)',
+    summary: 'Resolve PayDrop recipient for transfer',
     description:
-      'Resolves the recipient’s Squad-linked bank account name via Squad payout account lookup, before calling POST /transactions/transfer.',
+      'Returns the recipient’s virtual account, registered name, and payout bank code for P2P. Does not call Squad NIP lookup (not supported for PayDrop VAs).',
   })
   @ApiResponse({ status: 200, description: 'Lookup result' })
   @ApiResponse({ status: 401, description: 'Unauthorized' })
@@ -41,8 +42,24 @@ export class TransactionsController {
   ) {
     return this.transactionsService.lookupRecipientSquadPayoutAccount(
       body.recipient_id,
-      body.nip_code,
     );
+  }
+
+  @Post('squad-transfer-requery')
+  @UseGuards(JwtAuthGuard)
+  @ApiBearerAuth()
+  @ApiOperation({
+    summary: 'Re-query Squad payout status',
+    description:
+      'Calls Squad POST /payout/requery for a PayDrop transaction that already has a squad_ref (e.g. PENDING transfer).',
+  })
+  @ApiResponse({ status: 200, description: 'Squad requery result' })
+  @ApiResponse({ status: 401, description: 'Unauthorized' })
+  async squadTransferRequery(
+    @CurrentUser('sub') userId: string,
+    @Body() body: SquadTransferRequeryDto,
+  ) {
+    return this.transactionsService.requerySquadTransfer(userId, body.transaction_id);
   }
 
   @Post('transfer/recipient-contact-insight')
@@ -72,7 +89,7 @@ export class TransactionsController {
   @ApiOperation({
     summary: 'Initiate Transfer',
     description:
-      'Initiate a transfer between PayDrop users. Performs fraud pre-scoring, verifies the recipient’s Squad virtual account via NIP lookup, then initiates payout. For a standalone NIP lookup (e.g. UI preview), use POST /transactions/squad-account-lookup.',
+      'Initiate a transfer between PayDrop users. Idempotency key is generated server-side and returned in the response. Performs fraud pre-scoring, verifies the recipient’s Squad virtual account via NIP lookup, then initiates payout. For a standalone NIP lookup (e.g. UI preview), use POST /transactions/squad-account-lookup.',
   })
   @ApiResponse({
     status: 200,
@@ -89,10 +106,6 @@ export class TransactionsController {
     description: 'Transfer blocked by fraud engine',
     type: TransferBlockedDto,
   })
-  @ApiResponse({
-    status: 409,
-    description: 'Duplicate idempotency key',
-  })
   @ApiResponse({ status: 401, description: 'Unauthorized' })
   async transfer(
     @CurrentUser('sub') senderId: string,
@@ -102,7 +115,6 @@ export class TransactionsController {
       senderId,
       body.recipient_id,
       body.amount,
-      body.idempotency_key,
       body.note,
       body.nip_code,
     );
@@ -192,7 +204,7 @@ export class TransactionsController {
     description: 'Fraud details retrieved',
     type: FraudDetailDto,
   })
-  @ApiResponse({ status: 404, description: 'Fraud event not found' })
+  @ApiResponse({ status: 404, description: 'Transaction not found or no fraud data' })
   @ApiResponse({ status: 401, description: 'Unauthorized' })
   async getFraudDetail(@Param('id') id: string) {
     return this.transactionsService.getFraudDetail(id);

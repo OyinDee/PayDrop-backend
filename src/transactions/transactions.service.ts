@@ -4,6 +4,7 @@ import {
   NotFoundException,
   UnprocessableEntityException,
   UnauthorizedException,
+  Logger,
 } from '@nestjs/common';
 import { v4 as uuidv4 } from 'uuid';
 import { PrismaService } from '../common/prisma/prisma.service';
@@ -11,11 +12,13 @@ import { RedisService } from '../common/services/redis.service';
 import { FraudService } from '../common/services/fraud.service';
 import { SquadService } from '../common/services/squad.service';
 import { ActivityLogService } from '../common/services/activity-log.service';
+import { WalletService } from '../wallet/wallet.service';
 import { normalizeNgPhone } from '../common/utils/phone.util';
+import { resolvePayoutNipCode } from '../common/utils/squad-bank-code.util';
 
 @Injectable()
 export class TransactionsService {
-  private readonly MIN_TRANSFER = 100n; // NGN 100
+  private readonly logger = new Logger(TransactionsService.name);
   private readonly CONFIRM_TTL_SECONDS = 900; // 15min
 
   constructor(
@@ -24,19 +27,63 @@ export class TransactionsService {
     private readonly fraud: FraudService,
     private readonly squad: SquadService,
     private readonly activityLog: ActivityLogService,
+    private readonly wallet: WalletService,
   ) {}
 
-  private recipientNipCode(
+  /** Normalize Squad payout requery/webhook-ish status labels. */
+  private classifySquadPayoutSettlement(
+    label: string,
+    raw: Record<string, unknown>,
+  ): 'success' | 'failed' | 'pending' {
+    const bits = [
+      label,
+      raw?.status,
+      raw?.transaction_status,
+      raw?.transfer_status,
+      raw?.response_description,
+      raw?.payment_status,
+      raw?.message,
+    ]
+      .filter((x) => typeof x === 'string')
+      .map((x) => String(x).toLowerCase());
+
+    const combined = bits.join(' ');
+
+    if (
+      /\b(success|successful|completed|complete|paid|credited|approved)\b/.test(
+        combined,
+      )
+    ) {
+      return 'success';
+    }
+    if (/\b(fail|failed|reversed|reversal|reject|declin)\b/.test(combined)) {
+      return 'failed';
+    }
+
+    const rc = raw?.response_code;
+    if (rc === '00' || rc === 0 || rc === '0') {
+      return 'success';
+    }
+
+    return 'pending';
+  }
+
+  private resolveRecipientNip(
     recipient: { squad_bank_code: string | null },
     nipCode?: string,
-  ): string {
-    return (nipCode || recipient.squad_bank_code || '').trim();
+  ): { nip: string; source: string } {
+    return resolvePayoutNipCode({
+      requestOverride: nipCode,
+      squadBankCodeStored: recipient.squad_bank_code,
+    });
   }
 
   /**
-   * Squad NIP account lookup for a PayDrop user's virtual account (payout rail).
+   * Resolve payout details for a PayDrop recipient VA.
+   * Squad NIP name lookup does not work for PayDrop-provisioned virtual accounts (424);
+   * we use the registered KYC name and VA number for P2P preview and payout.
    */
-  private async squadLookupRecipient(
+  private resolveRecipientPayoutDetails(
     recipient: {
       first_name: string;
       last_name: string;
@@ -44,38 +91,133 @@ export class TransactionsService {
       squad_bank_code: string | null;
     },
     nipCode?: string,
+    logContext: Record<string, unknown> = {},
   ) {
     if (!recipient.squad_virtual_account) {
       throw new BadRequestException('Recipient cannot receive transfers yet');
     }
-    const nip = this.recipientNipCode(recipient, nipCode);
-    const lookup = await this.squad.lookupAccount(
-      nip,
-      recipient.squad_virtual_account,
-    );
+    const { nip, source } = this.resolveRecipientNip(recipient, nipCode);
     const recipientName = `${recipient.first_name} ${recipient.last_name}`.trim();
-    const nameMatches =
-      !lookup.account_name ||
-      lookup.account_name.toLowerCase() === recipientName.toLowerCase();
-    return { lookup, recipientName, nameMatches, nip };
+
+    this.logger.log(
+      JSON.stringify({
+        event: 'paydrop_recipient_payout_resolve',
+        lookup_source: 'paydrop_profile',
+        squad_virtual_account: recipient.squad_virtual_account,
+        nip_code_for_payout: nip,
+        nip_code_source: source,
+        squad_bank_code_stored: recipient.squad_bank_code,
+        registered_name: recipientName,
+        ...logContext,
+      }),
+    );
+
+    return {
+      lookup: {
+        account_name: recipientName,
+        account_number: recipient.squad_virtual_account,
+      },
+      recipientName,
+      nameMatches: true,
+      nip,
+      lookupSource: 'paydrop_profile' as const,
+    };
   }
 
-  async lookupRecipientSquadPayoutAccount(recipientId: string, nipCode?: string) {
+  async lookupRecipientSquadPayoutAccount(recipientId: string) {
     const recipient = await this.prisma.user.findUnique({
       where: { id: recipientId },
     });
     if (!recipient) {
       throw new NotFoundException('Recipient not found');
     }
-    const { lookup, recipientName, nameMatches, nip } =
-      await this.squadLookupRecipient(recipient, nipCode);
+    const { lookup, recipientName, nameMatches, nip, lookupSource } =
+      await this.resolveRecipientPayoutDetails(recipient, undefined, {
+        recipient_id: recipientId,
+      });
     return {
       recipient_id: recipientId,
-      nip_code: lookup.nip_code || nip,
       squad_virtual_account: recipient.squad_virtual_account,
+      nip_code: nip,
+      lookup_source: lookupSource,
       account_name: lookup.account_name,
       registered_name: recipientName,
       name_matches_registered: nameMatches,
+    };
+  }
+
+  async requerySquadTransfer(userId: string, transactionId: string) {
+    const tx = await this.prisma.transaction.findUnique({
+      where: { id: transactionId },
+    });
+    if (!tx || (tx.sender_id !== userId && tx.recipient_id !== userId)) {
+      throw new NotFoundException('Transaction not found');
+    }
+    if (!tx.squad_ref) {
+      throw new BadRequestException('Transaction has no Squad payout reference yet');
+    }
+
+    const result = await this.squad.requeryTransfer(tx.squad_ref);
+    const settlement = this.classifySquadPayoutSettlement(
+      result.status,
+      result.raw,
+    );
+
+    let paydrop_settlement:
+      | 'unchanged'
+      | 'completed'
+      | 'failed'
+      | 'not_applicable' = 'unchanged';
+
+    if (tx.type === 'TRANSFER') {
+      if (settlement === 'success') {
+        const applied =
+          await this.wallet.completePendingP2pTransfer(tx.id);
+        if (applied) {
+          paydrop_settlement = 'completed';
+          await this.redis.set(`squad_ref:${tx.squad_ref}`, '1', 86400);
+        } else {
+          const cur = await this.prisma.transaction.findUnique({
+            where: { id: tx.id },
+            select: { status: true },
+          });
+          if (cur?.status === 'COMPLETED') {
+            await this.redis.set(`squad_ref:${tx.squad_ref}`, '1', 86400);
+          }
+        }
+      } else if (settlement === 'failed') {
+        const applied = await this.wallet.failPendingP2pTransfer(tx.id);
+        if (applied) {
+          paydrop_settlement = 'failed';
+          await this.redis.set(`squad_ref:${tx.squad_ref}`, '1', 86400);
+        } else {
+          const cur = await this.prisma.transaction.findUnique({
+            where: { id: tx.id },
+            select: { status: true },
+          });
+          if (cur?.status === 'FAILED') {
+            await this.redis.set(`squad_ref:${tx.squad_ref}`, '1', 86400);
+          }
+        }
+      } else {
+        paydrop_settlement = 'unchanged';
+      }
+    } else {
+      paydrop_settlement = 'not_applicable';
+    }
+
+    const fresh = await this.prisma.transaction.findUnique({
+      where: { id: tx.id },
+      select: { status: true },
+    });
+
+    return {
+      transaction_id: tx.id,
+      squad_ref: tx.squad_ref,
+      squad_settlement_hint: settlement,
+      paydrop_settlement_applied: paydrop_settlement,
+      paydrop_transaction_status: fresh?.status,
+      ...result,
     };
   }
 
@@ -150,7 +292,6 @@ export class TransactionsService {
     senderId: string,
     recipientId: string,
     amount: number,
-    idempotencyKey: string,
     note?: string,
     nipCode?: string,
   ) {
@@ -158,24 +299,11 @@ export class TransactionsService {
       throw new BadRequestException('Cannot transfer to yourself');
     }
 
-    const amountKobo = BigInt(amount);
-    if (amountKobo < this.MIN_TRANSFER) {
-      throw new BadRequestException('Minimum transfer is 100 naira');
-    }
+    const idempotencyKey = uuidv4();
 
-    // Pre-check 1 — Idempotency (return original response; do not reprocess)
-    const existing = await this.prisma.transaction.findUnique({
-      where: { idempotency_key: idempotencyKey },
-    });
-    if (existing) {
-      return {
-        transaction_id: existing.id,
-        status: existing.status,
-        fraud_score: existing.fraud_score,
-        verdict: existing.verdict,
-        squad_ref: existing.squad_ref,
-        confirm_token: existing.confirm_token,
-      };
+    const amountKobo = BigInt(amount);
+    if (amountKobo <= 0n) {
+      throw new BadRequestException('Amount must be greater than zero (value is in kobo)');
     }
 
     const sender = await this.prisma.user.findUnique({
@@ -248,7 +376,7 @@ export class TransactionsService {
       });
 
       const confirmToken = uuidv4();
-      const recipientNipCode = (nipCode || recipient.squad_bank_code || '').trim();
+      const { nip: recipientNipCode } = this.resolveRecipientNip(recipient, nipCode);
       await this.redis.set(
         `confirm:${confirmToken}`,
         {
@@ -273,6 +401,7 @@ export class TransactionsService {
       });
 
       return {
+        idempotency_key: idempotencyKey,
         transaction_id: tx.id,
         status: 'PENDING_REVIEW',
         fraud_score: fraud.score,
@@ -295,7 +424,11 @@ export class TransactionsService {
       }
 
       const { lookup, recipientName, nameMatches, nip } =
-        await this.squadLookupRecipient(recipient, nipCode);
+        await this.resolveRecipientPayoutDetails(recipient, nipCode, {
+          sender_id: senderId,
+          recipient_id: recipientId,
+          flow: 'transfer',
+        });
       if (!nameMatches) {
         throw new BadRequestException('Recipient account name mismatch');
       }
@@ -324,8 +457,12 @@ export class TransactionsService {
         },
       });
 
-      return { txRow, squadRef: squadTransfer.transaction_ref };
-    })) as { txRow: any; squadRef: string };
+      return {
+        txRow,
+        squadRef: squadTransfer.transaction_ref,
+        nipRef: squadTransfer.nip_transaction_reference,
+      };
+    })) as { txRow: any; squadRef: string; nipRef?: string };
 
     await this.activityLog.log(senderId, 'TRANSFER_INITIATED', {
       transaction_id: created.txRow.id,
@@ -335,11 +472,13 @@ export class TransactionsService {
     });
 
     return {
+      idempotency_key: idempotencyKey,
       transaction_id: created.txRow.id,
       status: 'PENDING',
       fraud_score: fraud.score,
       verdict: 'ALLOW',
       squad_ref: created.squadRef,
+      nip_transaction_reference: created.nipRef,
     };
   }
 
@@ -358,6 +497,7 @@ export class TransactionsService {
     if (!tx) throw new NotFoundException('Transaction not found');
     if (tx.status !== 'PENDING_REVIEW') {
       return {
+        idempotency_key: tx.idempotency_key,
         transaction_id: tx.id,
         status: tx.status,
         fraud_score: tx.fraud_score,
@@ -384,7 +524,11 @@ export class TransactionsService {
       }
 
       const { lookup, recipientName, nameMatches, nip } =
-        await this.squadLookupRecipient(recipient, nipFromPayload);
+        await this.resolveRecipientPayoutDetails(recipient, nipFromPayload, {
+          sender_id: senderId,
+          recipient_id: recipient.id,
+          flow: 'transfer_confirm',
+        });
       if (!nameMatches) {
         throw new BadRequestException('Recipient account name mismatch');
       }
@@ -414,6 +558,7 @@ export class TransactionsService {
     });
 
     return {
+      idempotency_key: initiated.updated.idempotency_key,
       transaction_id: initiated.updated.id,
       status: initiated.updated.status,
       fraud_score: initiated.updated.fraud_score,
@@ -485,19 +630,41 @@ export class TransactionsService {
   }
 
   async getFraudDetail(transactionId: string) {
+    const transaction = await this.prisma.transaction.findUnique({
+      where: { id: transactionId },
+    });
+    if (!transaction) {
+      throw new NotFoundException('Transaction not found');
+    }
+
     const fraudEvent = await this.prisma.fraudEvent.findFirst({
       where: { transaction_id: transactionId },
     });
 
-    if (!fraudEvent) {
-      throw new NotFoundException('Fraud event not found');
+    if (fraudEvent) {
+      return {
+        score: fraudEvent.score,
+        verdict: fraudEvent.verdict,
+        reason: fraudEvent.reason,
+        features: fraudEvent.features as Record<string, unknown>,
+      };
     }
 
-    return {
-      score: fraudEvent.score,
-      verdict: fraudEvent.verdict,
-      reason: fraudEvent.reason,
-      features: fraudEvent.features,
-    };
+    if (
+      transaction.fraud_score != null ||
+      transaction.verdict != null ||
+      transaction.fraud_reason != null
+    ) {
+      return {
+        score: transaction.fraud_score ?? 0,
+        verdict: transaction.verdict ?? 'ALLOW',
+        reason:
+          transaction.fraud_reason ??
+          'Fraud verdict stored on transaction (external fraud microservice scores are not persisted as FraudEvent rows).',
+        features: {} as Record<string, unknown>,
+      };
+    }
+
+    throw new NotFoundException('No fraud scoring data for this transaction');
   }
 }

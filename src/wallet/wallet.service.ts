@@ -4,6 +4,7 @@ import {
   NotFoundException,
   ConflictException,
 } from '@nestjs/common';
+import { randomUUID } from 'crypto';
 import { Cron } from '@nestjs/schedule';
 import { PrismaService } from '../common/prisma/prisma.service';
 import { RedisService } from '../common/services/redis.service';
@@ -97,8 +98,9 @@ export class WalletService {
     bankCode: string,
     accountNumber: string,
     accountName: string,
-    idempotencyKey: string,
   ): Promise<any> {
+    const idempotencyKey = randomUUID();
+
     // Validation
     if (amount < this.MIN_WITHDRAWAL) {
       throw new BadRequestException(
@@ -113,6 +115,7 @@ export class WalletService {
 
     if (existingTx) {
       return {
+        idempotency_key: existingTx.idempotency_key,
         transaction_id: existingTx.id,
         status: existingTx.status,
         squad_ref: existingTx.squad_ref,
@@ -190,6 +193,7 @@ export class WalletService {
       });
 
       return {
+        idempotency_key: idempotencyKey,
         transaction_id: transaction.id,
         status: 'PENDING',
         squad_ref: squadTransfer.transaction_ref,
@@ -301,6 +305,73 @@ export class WalletService {
       await this.redisService.del(dedupeKey);
       throw e;
     }
+  }
+
+  /**
+   * Idempotent: PENDING TRANSFER → COMPLETED, debit sender, credit recipient (Squad webhook or requery).
+   * Uses updateMany so concurrent webhook + requery cannot double-apply.
+   */
+  async completePendingP2pTransfer(transactionId: string): Promise<boolean> {
+    type P2pSnapshot = { sender_id: string; amount: bigint; id: string };
+
+    const snapshot = await this.prisma.$transaction<P2pSnapshot | null>(
+      async (tx: any): Promise<P2pSnapshot | null> => {
+        const updated = await tx.transaction.updateMany({
+          where: { id: transactionId, type: 'TRANSFER', status: 'PENDING' },
+          data: { status: 'COMPLETED' },
+        });
+        if (updated.count === 0) {
+          return null;
+        }
+
+        const row = await tx.transaction.findUnique({
+          where: { id: transactionId },
+        });
+        if (!row?.sender_id || !row.recipient_id) {
+          throw new Error(
+            'Invariant: completed TRANSFER missing sender or recipient',
+          );
+        }
+
+        await tx.wallet.update({
+          where: { user_id: row.sender_id },
+          data: { balance: { decrement: row.amount } },
+        });
+        await tx.wallet.update({
+          where: { user_id: row.recipient_id },
+          data: { balance: { increment: row.amount } },
+        });
+
+        return { sender_id: row.sender_id, amount: row.amount, id: row.id };
+      },
+    );
+
+    if (snapshot) {
+      await this.activityLog.log(snapshot.sender_id, 'TRANSFER_COMPLETED', {
+        transaction_id: snapshot.id,
+        amount: Number(snapshot.amount),
+      });
+      return true;
+    }
+    return false;
+  }
+
+  /** Idempotent: PENDING TRANSFER → FAILED (no wallet movement — balance was never held). */
+  async failPendingP2pTransfer(transactionId: string): Promise<boolean> {
+    const updated = await this.prisma.transaction.updateMany({
+      where: { id: transactionId, type: 'TRANSFER', status: 'PENDING' },
+      data: { status: 'FAILED' },
+    });
+    if (updated.count === 0) {
+      return false;
+    }
+    const tx = await this.prisma.transaction.findUnique({
+      where: { id: transactionId },
+    });
+    await this.activityLog.log(tx!.sender_id || '', 'TRANSFER_FAILED', {
+      transaction_id: transactionId,
+    });
+    return true;
   }
 
   /**

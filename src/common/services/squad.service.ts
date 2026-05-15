@@ -1,10 +1,20 @@
-import { Injectable, BadRequestException } from '@nestjs/common';
+import { Injectable, BadRequestException, Logger } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { randomUUID } from 'crypto';
-import axios, { AxiosInstance } from 'axios';
+import axios, { AxiosInstance, AxiosResponse } from 'axios';
+import { mapSquadBankCodeToNip } from '../utils/squad-bank-code.util';
+
+type SquadPayoutAttemptLog = {
+  variant: 'bank_code' | 'nip_code';
+  request_body: Record<string, unknown>;
+  http_status?: number;
+  response_body?: unknown;
+  error_message?: string;
+};
 
 @Injectable()
 export class SquadService {
+  private readonly logger = new Logger(SquadService.name);
   private client: AxiosInstance;
   private secretKey: string | undefined;
   private webhookSecret: string | undefined;
@@ -70,11 +80,75 @@ export class SquadService {
     );
   }
 
-  private async postPayoutWithCodeFallback<T>(
+  private squadBaseUrl(): string {
+    return String(this.client.defaults.baseURL || '');
+  }
+
+  private logSquadOutgoing(
+    operation: string,
+    path: string,
+    context: Record<string, unknown>,
+    requestBody: Record<string, unknown>,
+  ): void {
+    this.logger.log(
+      JSON.stringify({
+        event: 'squad_request',
+        operation,
+        method: 'POST',
+        base_url: this.squadBaseUrl(),
+        path,
+        context,
+        request_body: requestBody,
+      }),
+    );
+  }
+
+  private logSquadFailure(
+    operation: string,
+    path: string,
+    context: Record<string, unknown>,
+    attempts: SquadPayoutAttemptLog[],
+  ): void {
+    const payload = JSON.stringify({
+      event: 'squad_request_failed',
+      operation,
+      method: 'POST',
+      base_url: this.squadBaseUrl(),
+      path,
+      context,
+      attempts,
+    });
+    if (context.paydrop_internal_va === true) {
+      this.logger.warn(payload);
+    } else {
+      this.logger.error(payload);
+    }
+  }
+
+  private recordAxiosAttempt(
+    variant: 'bank_code' | 'nip_code',
+    requestBody: Record<string, unknown>,
+    error: unknown,
+  ): SquadPayoutAttemptLog {
+    const entry: SquadPayoutAttemptLog = { variant, request_body: requestBody };
+    if (axios.isAxiosError(error)) {
+      entry.http_status = error.response?.status;
+      entry.response_body = error.response?.data;
+      entry.error_message = getAxiosErrorMessage(error);
+    } else {
+      entry.error_message =
+        error instanceof Error ? error.message : String(error);
+    }
+    return entry;
+  }
+
+  private async postPayoutWithCodeFallback(
     path: string,
     resolvedCode: string,
     payloadWithoutCode: Record<string, unknown>,
-  ): Promise<T> {
+    operation: string,
+    requestContext: Record<string, unknown> = {},
+  ): Promise<AxiosResponse<{ data?: Record<string, unknown> }>> {
     const bankCodePayload = {
       ...payloadWithoutCode,
       bank_code: resolvedCode,
@@ -83,23 +157,92 @@ export class SquadService {
       ...payloadWithoutCode,
       nip_code: resolvedCode,
     };
+    const attempts: SquadPayoutAttemptLog[] = [];
+
+    this.logSquadOutgoing(operation, path, requestContext, bankCodePayload);
 
     try {
-      const res = await this.client.post(path, bankCodePayload);
-      return res as unknown as T;
+      return await this.postWithTransientRetry(path, bankCodePayload);
     } catch (error) {
-      if (!axios.isAxiosError(error)) throw error;
+      attempts.push(this.recordAxiosAttempt('bank_code', bankCodePayload, error));
+
+      if (!axios.isAxiosError(error)) {
+        this.logSquadFailure(operation, path, requestContext, attempts);
+        throw error;
+      }
 
       const msg = String(error.response?.data?.message || '').toLowerCase();
       const shouldRetryWithNip =
         (msg.includes('nip_code') && msg.includes('required')) ||
-        (msg.includes('bank_code') && (msg.includes('is not allowed') || msg.includes('not allowed')));
+        (msg.includes('bank_code') &&
+          (msg.includes('is not allowed') || msg.includes('not allowed')));
 
-      if (!shouldRetryWithNip) throw error;
+      if (!shouldRetryWithNip) {
+        this.logSquadFailure(operation, path, requestContext, attempts);
+        throw error;
+      }
 
-      const res = await this.client.post(path, nipCodePayload);
-      return res as unknown as T;
+      this.logger.warn(
+        JSON.stringify({
+          event: 'squad_request_retry',
+          operation,
+          path,
+          retry_variant: 'nip_code',
+          request_body: nipCodePayload,
+        }),
+      );
+
+      try {
+        return await this.postWithTransientRetry(path, nipCodePayload);
+      } catch (retryError) {
+        attempts.push(this.recordAxiosAttempt('nip_code', nipCodePayload, retryError));
+        this.logSquadFailure(operation, path, requestContext, attempts);
+        throw retryError;
+      }
     }
+  }
+
+  private isTransientSquadStatus(status?: number): boolean {
+    return status != null && [500, 502, 503].includes(status);
+  }
+
+  private sleep(ms: number): Promise<void> {
+    return new Promise((resolve) => setTimeout(resolve, ms));
+  }
+
+  /** Retry Squad 5xx / 424 on account lookup (sandbox is often flaky). */
+  private async postWithTransientRetry(
+    path: string,
+    body: Record<string, unknown>,
+    maxAttempts = 3,
+  ): Promise<AxiosResponse<{ data?: Record<string, unknown> }>> {
+    let lastError: unknown;
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+      try {
+        return await this.client.post(path, body);
+      } catch (error) {
+        lastError = error;
+        const status = axios.isAxiosError(error)
+          ? error.response?.status
+          : undefined;
+        const canRetry =
+          attempt < maxAttempts && this.isTransientSquadStatus(status);
+        if (!canRetry) throw error;
+
+        this.logger.warn(
+          JSON.stringify({
+            event: 'squad_transient_retry',
+            path,
+            attempt,
+            max_attempts: maxAttempts,
+            http_status: status,
+            delay_ms: 800 * attempt,
+          }),
+        );
+        await this.sleep(800 * attempt);
+      }
+    }
+    throw lastError;
   }
 
   /**
@@ -162,43 +305,104 @@ export class SquadService {
 
   /**
    * NIP account lookup before payout (Squad Payout API).
-   * Squad expects nip_code (6-char bank code) not bank_code.
    * @see https://docs.squadco.com/Transfer-API/transfer-apis
    */
   async lookupAccount(
-    nipCode: string,
+    bankCode: string,
     accountNumber: string,
-  ): Promise<{ account_name: string; nip_code: string }> {
-    try {
-      const resolvedNipCode = this.resolveNipCode(nipCode);
-      const response = await this.postPayoutWithCodeFallback<any>(
-        '/payout/account/lookup',
-        resolvedNipCode,
-        {
-          account_number: accountNumber,
-        },
-      );
+    logContext: Record<string, unknown> = {},
+  ): Promise<{ account_name: string; account_number: string }> {
+    const primaryCode = this.resolveNipCode(bankCode);
+    const storedRaw = String(logContext.squad_bank_code_stored ?? '').trim();
+    const mappedStored = mapSquadBankCodeToNip(storedRaw);
+    // Squad requires 6-digit NIP bank_code — never send short VA codes like "058".
+    const bankCodesTried = [
+      ...new Set(
+        [primaryCode, mappedStored].filter(
+          (c): c is string => typeof c === 'string' && /^\d{6}$/.test(c),
+        ),
+      ),
+    ];
 
-      if (response.status !== 200 || !response.data?.data) {
-        throw new Error('Account not found');
-      }
+    const requestContext = {
+      input_bank_code: bankCode,
+      primary_nip_code: primaryCode,
+      bank_codes_tried: bankCodesTried,
+      account_number: accountNumber,
+      is_sandbox: this.isSandbox,
+      ...logContext,
+    };
 
-      const d = response.data.data as Record<string, unknown>;
-      return {
-        account_name: String(d.account_name ?? ''),
-        nip_code: String(d.nip_code ?? resolvedNipCode),
-      };
-    } catch (error) {
-      const msg = getAxiosErrorMessage(error);
-      if (axios.isAxiosError(error)) {
-        const status = error.response?.status;
-        const data = error.response?.data;
-        console.error('Squad account lookup error:', { status, data });
-      } else {
-        console.error('Squad account lookup error:', error);
+    const attempts: SquadPayoutAttemptLog[] = [];
+    let lastError: unknown;
+
+    for (const code of bankCodesTried) {
+      const body = { account_number: accountNumber, bank_code: code };
+      this.logSquadOutgoing('account_lookup', '/payout/account/lookup', {
+        ...requestContext,
+        bank_code_attempt: code,
+      }, body);
+
+      try {
+        const response = await this.postWithTransientRetry(
+          '/payout/account/lookup',
+          body,
+          2,
+        );
+
+        if (response.status !== 200 || !response.data?.data) {
+          throw new Error('Account not found');
+        }
+
+        const d = response.data.data as Record<string, unknown>;
+        return {
+          account_name: String(d.account_name ?? ''),
+          account_number: String(d.account_number ?? accountNumber),
+        };
+      } catch (error) {
+        lastError = error;
+        attempts.push(this.recordAxiosAttempt('bank_code', body, error));
       }
-      throw new BadRequestException('Account lookup failed: ' + msg);
     }
+
+    this.logSquadFailure(
+      'account_lookup',
+      '/payout/account/lookup',
+      requestContext,
+      attempts,
+    );
+
+    const msg = getAxiosErrorMessage(lastError);
+    const httpStatus = axios.isAxiosError(lastError)
+      ? lastError.response?.status
+      : undefined;
+    const saw424 = attempts.some((a) => a.http_status === 424);
+    const saw500 = attempts.some((a) => a.http_status === 500);
+    const paydropInternal = logContext.paydrop_internal_va === true;
+
+    let hint: string | undefined;
+    if (saw424 || httpStatus === 424) {
+      hint =
+        'Squad NIP lookup could not resolve this virtual account (424). PayDrop uses the registered profile name for P2P when NIP lookup is unavailable.';
+    } else if (saw500 || httpStatus === 500) {
+      hint =
+        'Squad payout API returned 500. Retries were attempted; try again or check Squad sandbox status.';
+    }
+
+    throw new BadRequestException({
+      message: 'Account lookup failed: ' + msg,
+      squad_http_status: httpStatus,
+      squad_message: msg,
+      squad_lookup_eligible_for_paydrop_fallback:
+        paydropInternal || saw424 || saw500 || httpStatus === 424 || httpStatus === 500,
+      ...(hint ? { hint } : {}),
+      request: {
+        account_number: accountNumber,
+        input_bank_code: bankCode,
+        bank_codes_tried: bankCodesTried,
+        squad_bank_code_stored: storedRaw || null,
+      },
+    });
   }
 
   /**
@@ -208,13 +412,16 @@ export class SquadService {
    */
   async initiateTransfer(
     amount: number, // kobo
-    nipCode: string,
+    bankCode: string,
     accountNumber: string,
     accountName: string,
     narration?: string,
-  ): Promise<{ transaction_ref: string; status: string }> {
+  ): Promise<{
+    transaction_ref: string;
+    status: string;
+    nip_transaction_reference?: string;
+  }> {
     try {
-      const resolvedNipCode = this.resolveNipCode(nipCode);
       if (!this.merchantId?.trim()) {
         throw new Error(
           'SQUAD_MERCHANT_ID is required for payout transfers (prefix for transaction_reference)',
@@ -223,10 +430,11 @@ export class SquadService {
 
       const transactionReference = `${this.merchantId.trim()}_pd_${randomUUID()}`;
       const remark = (narration || 'PayDrop Transfer').slice(0, 120);
+      const resolvedCode = this.resolveNipCode(bankCode);
 
-      const response = await this.postPayoutWithCodeFallback<any>(
+      const response = await this.postPayoutWithCodeFallback(
         '/payout/transfer',
-        resolvedNipCode,
+        resolvedCode,
         {
           transaction_reference: transactionReference,
           amount: String(Math.floor(amount)),
@@ -234,6 +442,13 @@ export class SquadService {
           account_name: accountName,
           currency_id: 'NGN',
           remark,
+        },
+        'transfer',
+        {
+          input_bank_code: bankCode,
+          resolved_nip_code: resolvedCode,
+          account_number: accountNumber,
+          amount_kobo: Math.floor(amount),
         },
       );
 
@@ -250,21 +465,73 @@ export class SquadService {
         (typeof data.status === 'string' && data.status) ||
         (typeof data.response_description === 'string' && data.response_description) ||
         'pending';
+      const nipRef =
+        typeof data.nip_transaction_reference === 'string'
+          ? data.nip_transaction_reference
+          : undefined;
 
       return {
         transaction_ref: ref,
         status,
+        nip_transaction_reference: nipRef,
+      };
+    } catch (error) {
+      const msg = getAxiosErrorMessage(error);
+      throw new BadRequestException('Transfer failed: ' + msg);
+    }
+  }
+
+  /**
+   * Re-query payout transfer status (Squad Payout API).
+   * @see https://docs.squadco.com/Transfer-API/transfer-apis
+   */
+  async requeryTransfer(transactionReference: string): Promise<{
+    transaction_reference: string;
+    status: string;
+    nip_transaction_reference?: string;
+    raw: Record<string, unknown>;
+  }> {
+    try {
+      const ref = transactionReference.trim();
+      if (!ref) {
+        throw new BadRequestException('transaction_reference is required');
+      }
+
+      const response = await this.client.post('/payout/requery', {
+        transaction_reference: ref,
+      });
+
+      if (response.status !== 200) {
+        throw new Error('Transfer requery failed');
+      }
+
+      const data = (response.data?.data ?? response.data) as Record<string, unknown>;
+      const status =
+        (typeof data?.status === 'string' && data.status) ||
+        (typeof data?.response_description === 'string' && data.response_description) ||
+        'unknown';
+
+      return {
+        transaction_reference:
+          (typeof data?.transaction_reference === 'string' && data.transaction_reference) ||
+          ref,
+        status,
+        nip_transaction_reference:
+          typeof data?.nip_transaction_reference === 'string'
+            ? data.nip_transaction_reference
+            : undefined,
+        raw: data && typeof data === 'object' ? data : {},
       };
     } catch (error) {
       const msg = getAxiosErrorMessage(error);
       if (axios.isAxiosError(error)) {
         const status = error.response?.status;
         const data = error.response?.data;
-        console.error('Squad transfer error:', { status, data });
+        console.error('Squad transfer requery error:', { status, data });
       } else {
-        console.error('Squad transfer error:', error);
+        console.error('Squad transfer requery error:', error);
       }
-      throw new BadRequestException('Transfer failed: ' + msg);
+      throw new BadRequestException('Transfer requery failed: ' + msg);
     }
   }
 

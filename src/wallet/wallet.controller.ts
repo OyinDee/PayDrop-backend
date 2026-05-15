@@ -84,18 +84,8 @@ export class WalletController {
         bank_code: { type: 'string', description: 'Bank code', example: '050' },
         account_number: { type: 'string', example: '0123456789' },
         account_name: { type: 'string', example: 'Oyindamola Ajala' },
-        idempotency_key: {
-          type: 'string',
-          description: 'UUID for idempotency',
-        },
       },
-      required: [
-        'amount',
-        'bank_code',
-        'account_number',
-        'account_name',
-        'idempotency_key',
-      ],
+      required: ['amount', 'bank_code', 'account_number', 'account_name'],
     },
   })
   @ApiResponse({
@@ -103,6 +93,7 @@ export class WalletController {
     description: 'Withdrawal initiated',
     schema: {
       properties: {
+        idempotency_key: { type: 'string' },
         transaction_id: { type: 'string' },
         status: { type: 'string', example: 'PENDING' },
         squad_ref: { type: 'string' },
@@ -111,7 +102,6 @@ export class WalletController {
   })
   @ApiResponse({ status: 400, description: 'Invalid request' })
   @ApiResponse({ status: 401, description: 'Unauthorized' })
-  @ApiResponse({ status: 409, description: 'Duplicate idempotency key' })
   async withdraw(
     @CurrentUser('sub') userId: string,
     @Body()
@@ -120,7 +110,6 @@ export class WalletController {
       bank_code: string;
       account_number: string;
       account_name: string;
-      idempotency_key: string;
     },
   ): Promise<any> {
     return await this.walletService.withdraw(
@@ -129,7 +118,6 @@ export class WalletController {
       body.bank_code,
       body.account_number,
       body.account_name,
-      body.idempotency_key,
     );
   }
 

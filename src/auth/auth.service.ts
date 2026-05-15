@@ -146,6 +146,17 @@ export class AuthService {
         );
       }
 
+      if (!existingUser.avatar_url?.trim()) {
+        const defaultAvatar = buildDefaultAvatarUrl(
+          existingUser.username || existingUser.id,
+        );
+        await this.prisma.user.update({
+          where: { id: existingUser.id },
+          data: { avatar_url: defaultAvatar },
+        });
+        existingUser.avatar_url = defaultAvatar;
+      }
+
       const accessToken = this.jwtService.generateAccessToken(
         existingUser.id,
         existingUser.phone,
