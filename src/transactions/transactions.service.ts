@@ -13,8 +13,17 @@ import { FraudService } from '../common/services/fraud.service';
 import { SquadService } from '../common/services/squad.service';
 import { ActivityLogService } from '../common/services/activity-log.service';
 import { WalletService } from '../wallet/wallet.service';
+import { NotificationsService } from '../notifications/notifications.service';
 import { normalizeNgPhone } from '../common/utils/phone.util';
 import { resolvePayoutNipCode } from '../common/utils/squad-bank-code.util';
+
+/** Format kobo as a readable naira string: 50000 → "₦500.00" */
+function naira(kobo: number | bigint): string {
+  return (Number(kobo) / 100).toLocaleString('en-NG', {
+    style: 'currency',
+    currency: 'NGN',
+  });
+}
 
 @Injectable()
 export class TransactionsService {
@@ -28,13 +37,13 @@ export class TransactionsService {
     private readonly squad: SquadService,
     private readonly activityLog: ActivityLogService,
     private readonly wallet: WalletService,
+    private readonly notifications: NotificationsService,
   ) {}
 
   // ─────────────────────────────────────────────────────────────
   // Private helpers
   // ─────────────────────────────────────────────────────────────
 
-  /** Normalise Squad payout requery/webhook-ish status labels. */
   private classifySquadPayoutSettlement(
     label: string,
     raw: Record<string, unknown>,
@@ -57,12 +66,10 @@ export class TransactionsService {
       /\b(success|successful|completed|complete|paid|credited|approved)\b/.test(
         combined,
       )
-    ) {
+    )
       return 'success';
-    }
-    if (/\b(fail|failed|reversed|reversal|reject|declin)\b/.test(combined)) {
+    if (/\b(fail|failed|reversed|reversal|reject|declin)\b/.test(combined))
       return 'failed';
-    }
 
     const rc = raw?.response_code;
     if (rc === '00' || rc === 0 || rc === '0') return 'success';
@@ -80,11 +87,6 @@ export class TransactionsService {
     });
   }
 
-  /**
-   * Resolve payout details for a PayDrop recipient VA.
-   * Squad NIP name lookup does not work for PayDrop-provisioned virtual accounts (424);
-   * we use the registered KYC name and VA number for P2P preview and payout.
-   */
   private resolveRecipientPayoutDetails(
     recipient: {
       first_name: string;
@@ -126,24 +128,15 @@ export class TransactionsService {
     };
   }
 
-  /**
-   * Shape a transaction row for API responses.
-   * Pass viewerUserId to get a 'debit' | 'credit' direction field.
-   */
   private formatTx(tx: any, viewerUserId?: string) {
     return {
       id: tx.id,
       sender_id: tx.sender_id,
       recipient_id: tx.recipient_id,
-      amount: tx.amount,
+      amount_kobo: Number(tx.amount),
+      amount: Number(tx.amount) / 100,
       type: tx.type,
       status: tx.status,
-      /**
-       * direction:
-       *   'debit'  – money left the viewer's wallet (they are the sender)
-       *   'credit' – money entered the viewer's wallet (they are the recipient)
-       *   null     – viewer context unknown (single-tx lookup without auth context)
-       */
       direction: viewerUserId
         ? tx.sender_id === viewerUserId
           ? 'debit'
@@ -239,7 +232,6 @@ export class TransactionsService {
           }
         }
       }
-      // else: settlement === 'pending' → paydrop_settlement stays 'unchanged'
     } else {
       paydrop_settlement = 'not_applicable';
     }
@@ -259,10 +251,6 @@ export class TransactionsService {
     };
   }
 
-  /**
-   * How many of the requester's address-book contacts (by phone) use PayDrop,
-   * and how many distinct contacts have completed a prior transfer to the recipient.
-   */
   async recipientContactTransferInsight(
     requesterUserId: string,
     recipientId: string,
@@ -388,12 +376,20 @@ export class TransactionsService {
           note: note || null,
         },
       });
+
       await this.activityLog.log(senderId, 'TRANSFER_BLOCKED', {
         recipient_id: recipientId,
         amount: Number(amountKobo),
         reason: fraud.reason,
         fraud_score: fraud.score,
       });
+
+      await this.notifications.send(
+        senderId,
+        'Transfer blocked',
+        `Your transfer of ${naira(amountKobo)} was blocked for security reasons. Contact support if you think this is an error.`,
+      );
+
       throw new UnprocessableEntityException({
         error: fraud.reason,
         fraud_score: fraud.score,
@@ -446,6 +442,12 @@ export class TransactionsService {
         reason: fraud.reason,
       });
 
+      await this.notifications.send(
+        senderId,
+        'Transfer needs your confirmation',
+        `Your transfer of ${naira(amountKobo)} requires additional verification. Please confirm to proceed.`,
+      );
+
       return {
         idempotency_key: idempotencyKey,
         transaction_id: tx.id,
@@ -457,59 +459,98 @@ export class TransactionsService {
       };
     }
 
-    // ── ALLOW: pessimistic lock → Squad → create PENDING ──────
-    const created = (await this.prisma.$transaction(async (tx: any) => {
-      await tx.$queryRaw`SELECT 1 FROM wallets WHERE user_id = ${senderId} FOR UPDATE`;
-
-      const lockedWallet = await tx.wallet.findUnique({
-        where: { user_id: senderId },
+    // ── ALLOW ──────────────────────────────────────────────────
+    // Step 1: Resolve recipient payout details (no DB writes, safe outside tx)
+    const { lookup, recipientName, nameMatches, nip } =
+      this.resolveRecipientPayoutDetails(recipient, nipCode, {
+        sender_id: senderId,
+        recipient_id: recipientId,
+        flow: 'transfer',
       });
-      if (!lockedWallet || lockedWallet.balance < amountKobo) {
-        throw new BadRequestException('Insufficient funds');
-      }
+    if (!nameMatches) {
+      throw new BadRequestException('Recipient account name mismatch');
+    }
 
-      const { lookup, recipientName, nameMatches, nip } =
-        await this.resolveRecipientPayoutDetails(recipient, nipCode, {
-          sender_id: senderId,
-          recipient_id: recipientId,
-          flow: 'transfer',
+    // Step 2: Balance pre-check before calling Squad (avoid unnecessary API call)
+    const walletPreCheck = await this.prisma.wallet.findUnique({
+      where: { user_id: senderId },
+    });
+    if (!walletPreCheck || walletPreCheck.balance < amountKobo) {
+      throw new BadRequestException('Insufficient funds');
+    }
+
+    // Step 3: Call Squad OUTSIDE the transaction — this is the slow external call
+    const squadTransfer = await this.squad.initiateTransfer(
+      Number(amountKobo),
+      nip,
+      recipient.squad_virtual_account!,
+      lookup.account_name || recipientName,
+      'PayDrop P2P Transfer',
+    );
+
+    // Step 4: Short DB-only transaction — pessimistic lock + recheck + insert
+    const created = (await this.prisma.$transaction(
+      async (tx: any) => {
+        await tx.$queryRaw`SELECT 1 FROM wallets WHERE user_id = ${senderId} FOR UPDATE`;
+
+        const lockedWallet = await tx.wallet.findUnique({
+          where: { user_id: senderId },
         });
-      if (!nameMatches) {
-        throw new BadRequestException('Recipient account name mismatch');
-      }
 
-      const squadTransfer = await this.squad.initiateTransfer(
-        Number(amountKobo),
-        nip,
-        recipient.squad_virtual_account!,
-        lookup.account_name || recipientName,
-        'PayDrop P2P Transfer',
-      );
+        // If balance check fails after Squad was already called, record the
+        // transaction as PENDING so the ref isn't lost — the requery cron /
+        // webhook will settle it (or it will bounce back from Squad's side).
+        if (!lockedWallet || lockedWallet.balance < amountKobo) {
+          await tx.transaction.create({
+            data: {
+              sender_id: senderId,
+              recipient_id: recipientId,
+              amount: amountKobo,
+              type: 'TRANSFER',
+              status: 'PENDING',
+              idempotency_key: idempotencyKey,
+              fraud_score: fraud.score,
+              verdict: 'ALLOW',
+              fraud_reason: fraud.reason,
+              squad_ref: squadTransfer.transaction_ref,
+              note: note || null,
+            },
+          });
+          throw new BadRequestException('Insufficient funds');
+        }
 
-      const txRow = await tx.transaction.create({
-        data: {
-          sender_id: senderId,
-          recipient_id: recipientId,
-          amount: amountKobo,
-          type: 'TRANSFER',
-          status: 'PENDING',
-          idempotency_key: idempotencyKey,
-          fraud_score: fraud.score,
-          verdict: 'ALLOW',
-          fraud_reason: fraud.reason,
-          squad_ref: squadTransfer.transaction_ref,
-          note: note || null,
-        },
-      });
+        const txRow = await tx.transaction.create({
+          data: {
+            sender_id: senderId,
+            recipient_id: recipientId,
+            amount: amountKobo,
+            type: 'TRANSFER',
+            status: 'PENDING',
+            idempotency_key: idempotencyKey,
+            fraud_score: fraud.score,
+            verdict: 'ALLOW',
+            fraud_reason: fraud.reason,
+            squad_ref: squadTransfer.transaction_ref,
+            note: note || null,
+          },
+        });
 
-      return {
-        txRow,
-        squadRef: squadTransfer.transaction_ref,
-        nipRef: squadTransfer.nip_transaction_reference,
-      };
-    })) as { txRow: any; squadRef: string; nipRef?: string };
+        return {
+          txRow,
+          squadRef: squadTransfer.transaction_ref,
+          nipRef: squadTransfer.nip_transaction_reference,
+          recipientName,
+        };
+      },
+    )) as {
+      txRow: any;
+      squadRef: string;
+      nipRef?: string;
+      recipientName: string;
+    };
 
-    // TRANSFER_SENT – logged for the sender after the Squad call succeeds
+    const senderName = `${sender.first_name} ${sender.last_name}`.trim();
+
     await this.activityLog.log(senderId, 'TRANSFER_SENT', {
       transaction_id: created.txRow.id,
       recipient_id: recipientId,
@@ -517,13 +558,24 @@ export class TransactionsService {
       squad_ref: created.squadRef,
     });
 
-    // TRANSFER_INITIATED – kept for backwards compatibility / audit trail
     await this.activityLog.log(senderId, 'TRANSFER_INITIATED', {
       transaction_id: created.txRow.id,
       recipient_id: recipientId,
       amount: Number(amountKobo),
       squad_ref: created.squadRef,
     });
+
+    await this.notifications.send(
+      senderId,
+      'Transfer sent',
+      `Your transfer of ${naira(amountKobo)} to ${created.recipientName} is being processed.`,
+    );
+
+    await this.notifications.send(
+      recipientId,
+      'Incoming transfer',
+      `${senderName} is sending you ${naira(amountKobo)}. It will reflect once confirmed.`,
+    );
 
     return {
       idempotency_key: idempotencyKey,
@@ -559,7 +611,6 @@ export class TransactionsService {
     });
     if (!tx) throw new NotFoundException('Transaction not found');
 
-    // If already progressed past PENDING_REVIEW (e.g. re-submit after success), return current state
     if (tx.status !== 'PENDING_REVIEW') {
       return {
         idempotency_key: tx.idempotency_key,
@@ -582,56 +633,77 @@ export class TransactionsService {
         ? nipOverride.trim()
         : undefined;
 
-    const initiated = (await this.prisma.$transaction(async (p: any) => {
-      await p.$queryRaw`SELECT 1 FROM wallets WHERE user_id = ${senderId} FOR UPDATE`;
-
-      const lockedWallet = await p.wallet.findUnique({
-        where: { user_id: senderId },
+    // Step 1: Resolve recipient payout details outside the transaction
+    const { lookup, recipientName, nameMatches, nip } =
+      this.resolveRecipientPayoutDetails(recipient, nipFromPayload, {
+        sender_id: senderId,
+        recipient_id: recipient.id,
+        flow: 'transfer_confirm',
       });
-      if (!lockedWallet || lockedWallet.balance < tx.amount) {
-        throw new BadRequestException('Insufficient funds');
-      }
+    if (!nameMatches) {
+      throw new BadRequestException('Recipient account name mismatch');
+    }
 
-      const { lookup, recipientName, nameMatches, nip } =
-        await this.resolveRecipientPayoutDetails(recipient, nipFromPayload, {
-          sender_id: senderId,
-          recipient_id: recipient.id,
-          flow: 'transfer_confirm',
+    // Step 2: Balance pre-check before calling Squad
+    const walletPreCheck = await this.prisma.wallet.findUnique({
+      where: { user_id: senderId },
+    });
+    if (!walletPreCheck || walletPreCheck.balance < tx.amount) {
+      throw new BadRequestException('Insufficient funds');
+    }
+
+    // Step 3: Call Squad OUTSIDE the transaction
+    const squadTransfer = await this.squad.initiateTransfer(
+      Number(tx.amount),
+      nip,
+      recipient.squad_virtual_account!,
+      lookup.account_name || recipientName,
+      'PayDrop P2P Transfer',
+    );
+
+    // Step 4: Short DB-only transaction — pessimistic lock + recheck + update
+    const initiated = (await this.prisma.$transaction(
+      async (p: any) => {
+        await p.$queryRaw`SELECT 1 FROM wallets WHERE user_id = ${senderId} FOR UPDATE`;
+
+        const lockedWallet = await p.wallet.findUnique({
+          where: { user_id: senderId },
         });
-      if (!nameMatches) {
-        throw new BadRequestException('Recipient account name mismatch');
-      }
+        if (!lockedWallet || lockedWallet.balance < tx.amount) {
+          // Squad already called — update the row with the ref so it can be
+          // reconciled, then surface the error to the caller.
+          await p.transaction.update({
+            where: { id: tx.id },
+            data: { squad_ref: squadTransfer.transaction_ref },
+          });
+          throw new BadRequestException('Insufficient funds');
+        }
 
-      const squadTransfer = await this.squad.initiateTransfer(
-        Number(tx.amount),
-        nip,
-        recipient.squad_virtual_account!,
-        lookup.account_name || recipientName,
-        'PayDrop P2P Transfer',
-      );
+        const updated = await p.transaction.update({
+          where: { id: tx.id },
+          data: { status: 'PENDING', squad_ref: squadTransfer.transaction_ref },
+        });
 
-      const updated = await p.transaction.update({
-        where: { id: tx.id },
-        data: {
-          status: 'PENDING',
-          squad_ref: squadTransfer.transaction_ref,
-        },
-      });
-
-      return { updated, squadRef: squadTransfer.transaction_ref };
-    })) as { updated: any; squadRef: string };
+        return { updated, squadRef: squadTransfer.transaction_ref, recipientName };
+      },
+    )) as { updated: any; squadRef: string; recipientName: string };
 
     await this.activityLog.log(senderId, 'TRANSFER_FLAG_CONFIRMED', {
       transaction_id: tx.id,
       squad_ref: initiated.squadRef,
     });
 
-    // Also log TRANSFER_SENT now that the flagged transfer has been confirmed and dispatched
     await this.activityLog.log(senderId, 'TRANSFER_SENT', {
       transaction_id: tx.id,
       squad_ref: initiated.squadRef,
       via: 'flag_confirm',
     });
+
+    await this.notifications.send(
+      senderId,
+      'Transfer confirmed',
+      `Your transfer of ${naira(tx.amount)} to ${initiated.recipientName} is now being processed.`,
+    );
 
     return {
       idempotency_key: initiated.updated.idempotency_key,
@@ -643,26 +715,18 @@ export class TransactionsService {
     };
   }
 
-  async getTransactions(
-    userId: string,
-    page: number = 1,
-    limit: number = 20,
-  ) {
+  async getTransactions(userId: string, page: number = 1, limit: number = 20) {
     const skip = (page - 1) * limit;
 
     const [transactions, total] = await Promise.all([
       this.prisma.transaction.findMany({
-        where: {
-          OR: [{ sender_id: userId }, { recipient_id: userId }],
-        },
+        where: { OR: [{ sender_id: userId }, { recipient_id: userId }] },
         skip,
         take: limit,
         orderBy: { created_at: 'desc' },
       }),
       this.prisma.transaction.count({
-        where: {
-          OR: [{ sender_id: userId }, { recipient_id: userId }],
-        },
+        where: { OR: [{ sender_id: userId }, { recipient_id: userId }] },
       }),
     ]);
 
@@ -674,10 +738,6 @@ export class TransactionsService {
     };
   }
 
-  /**
-   * @param viewerUserId  Pass the authenticated user's ID to get a direction field.
-   *                      Omit (or pass undefined) for admin/internal lookups.
-   */
   async getTransaction(transactionId: string, viewerUserId?: string) {
     const transaction = await this.prisma.transaction.findUnique({
       where: { id: transactionId },

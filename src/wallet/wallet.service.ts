@@ -2,7 +2,6 @@ import {
   Injectable,
   BadRequestException,
   NotFoundException,
-  ConflictException,
 } from '@nestjs/common';
 import { randomUUID } from 'crypto';
 import { Cron } from '@nestjs/schedule';
@@ -10,6 +9,15 @@ import { PrismaService } from '../common/prisma/prisma.service';
 import { RedisService } from '../common/services/redis.service';
 import { SquadService } from '../common/services/squad.service';
 import { ActivityLogService } from '../common/services/activity-log.service';
+import { NotificationsService } from '../notifications/notifications.service';
+
+/** Format kobo as a readable naira string: 50000 → "₦500.00" */
+function naira(kobo: number | bigint): string {
+  return (Number(kobo) / 100).toLocaleString('en-NG', {
+    style: 'currency',
+    currency: 'NGN',
+  });
+}
 
 @Injectable()
 export class WalletService {
@@ -20,61 +28,32 @@ export class WalletService {
     private redisService: RedisService,
     private squadService: SquadService,
     private activityLog: ActivityLogService,
+    private notifications: NotificationsService,
   ) {}
 
-  /**
-   * Get current wallet balance
-   */
+  // ─────────────────────────────────────────────────────────────
+  // Balance & account
+  // ─────────────────────────────────────────────────────────────
+
   async getBalance(userId: string): Promise<any> {
     const wallet = await this.prisma.wallet.findUnique({
       where: { user_id: userId },
     });
-
-    if (!wallet) {
-      throw new NotFoundException('Wallet not found');
-    }
+    if (!wallet) throw new NotFoundException('Wallet not found');
 
     return {
-      balance: wallet.balance,
+      balance_kobo: Number(wallet.balance),
+      balance: Number(wallet.balance) / 100,
       currency: wallet.currency,
     };
   }
 
-  @Cron('0 */5 * * * *')
-  async checkStuckWithdrawals(): Promise<void> {
-    const cutoff = new Date(Date.now() - 5 * 60 * 1000);
-    const stuck = await this.prisma.transaction.findMany({
-      where: {
-        type: 'WITHDRAWAL',
-        status: 'PENDING',
-        created_at: { lt: cutoff },
-      },
-    });
-
-    for (const tx of stuck) {
-      await this.prisma.transaction.update({
-        where: { id: tx.id },
-        data: { status: 'FAILED' },
-      });
-      await this.activityLog.log(tx.sender_id || '', 'WITHDRAWAL_FAILED', {
-        transaction_id: tx.id,
-      });
-    }
-  }
-
-  /**
-   * Get Squad virtual account details for top-up
-   */
   async getAccount(userId: string): Promise<any> {
     const user = await this.prisma.user.findUnique({
       where: { id: userId },
       include: { wallet: true },
     });
-
-    if (!user || !user.wallet) {
-      throw new NotFoundException('Wallet not found');
-    }
-
+    if (!user || !user.wallet) throw new NotFoundException('Wallet not found');
     if (!user.squad_virtual_account) {
       throw new BadRequestException(
         'Virtual account not provisioned. Please contact support.',
@@ -89,9 +68,10 @@ export class WalletService {
     };
   }
 
-  /**
-   * Initiate withdrawal to external bank
-   */
+  // ─────────────────────────────────────────────────────────────
+  // Withdrawal
+  // ─────────────────────────────────────────────────────────────
+
   async withdraw(
     userId: string,
     amount: bigint,
@@ -101,18 +81,15 @@ export class WalletService {
   ): Promise<any> {
     const idempotencyKey = randomUUID();
 
-    // Validation
     if (amount < this.MIN_WITHDRAWAL) {
       throw new BadRequestException(
         `Minimum withdrawal is ${Number(this.MIN_WITHDRAWAL) / 100} naira`,
       );
     }
 
-    // Pre-check 1: Idempotency
     const existingTx = await this.prisma.transaction.findUnique({
       where: { idempotency_key: idempotencyKey },
     });
-
     if (existingTx) {
       return {
         idempotency_key: existingTx.idempotency_key,
@@ -122,48 +99,34 @@ export class WalletService {
       };
     }
 
-    // Pre-check 2: Balance
     const wallet = await this.prisma.wallet.findUnique({
       where: { user_id: userId },
     });
+    if (!wallet) throw new NotFoundException('Wallet not found');
+    if (wallet.balance < amount) throw new BadRequestException('Insufficient funds');
 
-    if (!wallet) {
-      throw new NotFoundException('Wallet not found');
-    }
-
-    if (wallet.balance < amount) {
-      throw new BadRequestException('Insufficient funds');
-    }
-
-    // Pre-check 3: Squad account lookup
     try {
       const accountLookup = await this.squadService.lookupAccount(
         bankCode,
         accountNumber,
       );
-
-      // Verify account name matches
       if (
-        accountLookup.account_name.toLowerCase() !==
-        accountName.toLowerCase()
+        accountLookup.account_name.toLowerCase() !== accountName.toLowerCase()
       ) {
         throw new BadRequestException('Account name does not match');
       }
-    } catch (error) {
+    } catch {
       throw new BadRequestException('Invalid bank account details');
     }
 
-    // Pessimistic lock: SELECT FOR UPDATE
     const lockedWallet = await this.prisma.wallet.findUnique({
       where: { user_id: userId },
     });
-
     if (!lockedWallet || lockedWallet.balance < amount) {
       throw new BadRequestException('Insufficient funds');
     }
 
     try {
-      // Call Squad API
       const squadTransfer = await this.squadService.initiateTransfer(
         Number(amount),
         bankCode,
@@ -172,7 +135,6 @@ export class WalletService {
         'PayDrop Withdrawal',
       );
 
-      // Create transaction record
       const transaction = await this.prisma.transaction.create({
         data: {
           sender_id: userId,
@@ -184,13 +146,18 @@ export class WalletService {
         },
       });
 
-      // Log activity
       await this.activityLog.log(userId, 'WITHDRAWAL_INITIATED', {
         amount: Number(amount),
         bank_code: bankCode,
         account_number: accountNumber,
         transaction_id: transaction.id,
       });
+
+      await this.notifications.send(
+        userId,
+        'Withdrawal initiated',
+        `Your withdrawal of ${naira(amount)} is being processed.`,
+      );
 
       return {
         idempotency_key: idempotencyKey,
@@ -199,44 +166,35 @@ export class WalletService {
         squad_ref: squadTransfer.transaction_ref,
       };
     } catch (error) {
-      const message = error instanceof Error ? error.message : 'Transfer failed';
+      const message =
+        error instanceof Error ? error.message : 'Transfer failed';
       throw new BadRequestException(message);
     }
   }
 
+  // ─────────────────────────────────────────────────────────────
+  // Simulate top-up (sandbox only)
+  // ─────────────────────────────────────────────────────────────
+
   /**
-   * Simulate top-up in sandbox (triggers real webhook)
-   * Amount in NAIRA (not kobo)
+   * Triggers Squad's sandbox simulate endpoint.
+   * Squad fires a real webhook → processWebhookPayment credits the wallet.
+   * Do NOT call processWebhookPayment here — that causes a double credit.
    */
   async simulateTopup(userId: string, amountNaira: number): Promise<any> {
-
-
-    const user = await this.prisma.user.findUnique({
-      where: { id: userId },
-    });
-
+    const user = await this.prisma.user.findUnique({ where: { id: userId } });
     if (!user || !user.squad_virtual_account) {
       throw new NotFoundException('Virtual account not found');
     }
 
     try {
-      const squadRef = await this.squadService.simulateTopup(
+      await this.squadService.simulateTopup(
         user.squad_virtual_account,
         amountNaira,
       );
-
-      const amountKobo = Math.round(amountNaira * 100);
-      const safeRef = squadRef || `sim_${Date.now()}_${userId}`;
-
-      await this.processWebhookPayment(
-        user.squad_virtual_account,
-        amountKobo,
-        safeRef,
-      );
-
       return {
         success: true,
-        message: 'Top-up simulation triggered',
+        message: 'Top-up simulation triggered — wallet will be credited via webhook',
       };
     } catch (error) {
       const message =
@@ -245,44 +203,33 @@ export class WalletService {
     }
   }
 
+  // ─────────────────────────────────────────────────────────────
+  // Webhook handlers
+  // ─────────────────────────────────────────────────────────────
+
   /**
-   * Process webhook payment (called by webhooks service)
+   * Called by the webhooks service when Squad confirms a top-up.
+   * Amount must be in kobo.
    */
   async processWebhookPayment(
     virtualAccountNumber: string,
     amount: number, // kobo
     squadRef: string,
   ): Promise<void> {
-    // Find user by virtual account
     const user = await this.prisma.user.findUnique({
       where: { squad_virtual_account: virtualAccountNumber },
     });
+    if (!user) throw new NotFoundException('Virtual account not found');
 
-    if (!user) {
-      throw new NotFoundException('Virtual account not found');
-    }
-
-    // Duplicate guard (atomic): only one worker should process a squadRef
     const dedupeKey = `squad_ref:${squadRef}`;
-    const acquired = await this.redisService.setIfNotExists(
-      dedupeKey,
-      '1',
-      86400,
-    );
-    if (!acquired) {
-      return;
-    }
+    const acquired = await this.redisService.setIfNotExists(dedupeKey, '1', 86400);
+    if (!acquired) return;
 
     try {
-      // Atomic DB transaction
       await this.prisma.$transaction(async (tx: any) => {
         await tx.wallet.update({
           where: { user_id: user.id },
-          data: {
-            balance: {
-              increment: BigInt(amount),
-            },
-          },
+          data: { balance: { increment: BigInt(amount) } },
         });
 
         await tx.transaction.create({
@@ -295,12 +242,18 @@ export class WalletService {
             idempotency_key: `webhook_${squadRef}`,
           },
         });
-
-        await this.activityLog.log(user.id, 'WALLET_FUNDED', {
-          amount,
-          squad_ref: squadRef,
-        });
       });
+
+      await this.activityLog.log(user.id, 'WALLET_FUNDED', {
+        amount,
+        squad_ref: squadRef,
+      });
+
+      await this.notifications.send(
+        user.id,
+        'Top-up successful',
+        `${naira(amount)} has been added to your PayDrop wallet.`,
+      );
     } catch (e) {
       await this.redisService.del(dedupeKey);
       throw e;
@@ -308,11 +261,15 @@ export class WalletService {
   }
 
   /**
-   * Idempotent: PENDING TRANSFER → COMPLETED, debit sender, credit recipient (Squad webhook or requery).
-   * Uses updateMany so concurrent webhook + requery cannot double-apply.
+   * Idempotent: PENDING TRANSFER → COMPLETED, debit sender, credit recipient.
    */
   async completePendingP2pTransfer(transactionId: string): Promise<boolean> {
-    type P2pSnapshot = { sender_id: string; amount: bigint; id: string };
+    type P2pSnapshot = {
+      sender_id: string;
+      recipient_id: string;
+      amount: bigint;
+      id: string;
+    };
 
     const snapshot = await this.prisma.$transaction<P2pSnapshot | null>(
       async (tx: any): Promise<P2pSnapshot | null> => {
@@ -320,9 +277,7 @@ export class WalletService {
           where: { id: transactionId, type: 'TRANSFER', status: 'PENDING' },
           data: { status: 'COMPLETED' },
         });
-        if (updated.count === 0) {
-          return null;
-        }
+        if (updated.count === 0) return null;
 
         const row = await tx.transaction.findUnique({
           where: { id: transactionId },
@@ -342,7 +297,12 @@ export class WalletService {
           data: { balance: { increment: row.amount } },
         });
 
-        return { sender_id: row.sender_id, amount: row.amount, id: row.id };
+        return {
+          sender_id: row.sender_id,
+          recipient_id: row.recipient_id,
+          amount: row.amount,
+          id: row.id,
+        };
       },
     );
 
@@ -351,46 +311,63 @@ export class WalletService {
         transaction_id: snapshot.id,
         amount: Number(snapshot.amount),
       });
+
+      // Notify sender
+      await this.notifications.send(
+        snapshot.sender_id,
+        'Transfer successful',
+        `Your transfer of ${naira(snapshot.amount)} was delivered successfully.`,
+      );
+
+      // Notify recipient
+      await this.notifications.send(
+        snapshot.recipient_id,
+        'You received money',
+        `${naira(snapshot.amount)} has been added to your PayDrop wallet.`,
+      );
+
       return true;
     }
     return false;
   }
 
-  /** Idempotent: PENDING TRANSFER → FAILED (no wallet movement — balance was never held). */
+  /** Idempotent: PENDING TRANSFER → FAILED (no wallet movement). */
   async failPendingP2pTransfer(transactionId: string): Promise<boolean> {
     const updated = await this.prisma.transaction.updateMany({
       where: { id: transactionId, type: 'TRANSFER', status: 'PENDING' },
       data: { status: 'FAILED' },
     });
-    if (updated.count === 0) {
-      return false;
-    }
+    if (updated.count === 0) return false;
+
     const tx = await this.prisma.transaction.findUnique({
       where: { id: transactionId },
     });
+
     await this.activityLog.log(tx!.sender_id || '', 'TRANSFER_FAILED', {
       transaction_id: transactionId,
     });
+
+    await this.notifications.send(
+      tx!.sender_id || '',
+      'Transfer failed',
+      `Your transfer of ${naira(tx!.amount)} could not be completed. No money was deducted.`,
+    );
+
     return true;
   }
 
   /**
-   * Process withdrawal webhook completion
+   * Process withdrawal webhook completion.
    */
   async processWithdrawalWebhook(
     squadRef: string,
     status: string,
   ): Promise<void> {
-    // Find transaction
     const transaction = await this.prisma.transaction.findFirst({
       where: { squad_ref: squadRef },
     });
+    if (!transaction) return;
 
-    if (!transaction) {
-      return; // Transaction not found, retry later
-    }
-
-    // Update transaction status
     const newStatus = status === 'success' ? 'COMPLETED' : 'FAILED';
 
     await this.prisma.transaction.update({
@@ -402,44 +379,69 @@ export class WalletService {
       await this.activityLog.log(
         transaction.sender_id || '',
         'WITHDRAWAL_COMPLETED',
-        {
-          transaction_id: transaction.id,
-          amount: Number(transaction.amount),
-        },
+        { transaction_id: transaction.id, amount: Number(transaction.amount) },
+      );
+
+      await this.notifications.send(
+        transaction.sender_id || '',
+        'Withdrawal successful',
+        `Your withdrawal of ${naira(transaction.amount)} has been processed successfully.`,
       );
     } else {
-      // Reverse balance if failed
-      const wallet = await this.prisma.wallet.findUnique({
+      // Reverse the deducted balance
+      await this.prisma.wallet.update({
         where: { user_id: transaction.sender_id || '' },
+        data: { balance: { increment: transaction.amount } },
       });
-
-      if (wallet) {
-        await this.prisma.wallet.update({
-          where: { user_id: transaction.sender_id || '' },
-          data: {
-            balance: {
-              increment: transaction.amount,
-            },
-          },
-        });
-      }
 
       await this.activityLog.log(
         transaction.sender_id || '',
         'WITHDRAWAL_FAILED',
-        {
-          transaction_id: transaction.id,
-        },
+        { transaction_id: transaction.id },
+      );
+
+      await this.notifications.send(
+        transaction.sender_id || '',
+        'Withdrawal failed',
+        `Your withdrawal of ${naira(transaction.amount)} failed. The amount has been returned to your wallet.`,
       );
     }
   }
 
-  /**
-   * Helper: Get bank name from code
-   */
+  // ─────────────────────────────────────────────────────────────
+  // Cron
+  // ─────────────────────────────────────────────────────────────
+
+  @Cron('0 */5 * * * *')
+  async checkStuckWithdrawals(): Promise<void> {
+    const cutoff = new Date(Date.now() - 5 * 60 * 1000);
+    const stuck = await this.prisma.transaction.findMany({
+      where: { type: 'WITHDRAWAL', status: 'PENDING', created_at: { lt: cutoff } },
+    });
+
+    for (const tx of stuck) {
+      await this.prisma.transaction.update({
+        where: { id: tx.id },
+        data: { status: 'FAILED' },
+      });
+      await this.activityLog.log(tx.sender_id || '', 'WITHDRAWAL_FAILED', {
+        transaction_id: tx.id,
+      });
+      await this.notifications.send(
+        tx.sender_id || '',
+        'Withdrawal failed',
+        `Your withdrawal of ${naira(tx.amount)} timed out and has been cancelled. Please try again.`,
+      );
+    }
+  }
+
+  // ─────────────────────────────────────────────────────────────
+  // Helpers
+  // ─────────────────────────────────────────────────────────────
+
   private getBankName(code: string | null): string {
     const banks: Record<string, string> = {
-      '050': 'Guaranty Trust Bank (GTB)',
+      '050': 'Ecobank',
       '058': 'Guaranty Trust Bank (GTB)',
       '057': 'Zenith Bank',
       '033': 'United Bank for Africa (UBA)',

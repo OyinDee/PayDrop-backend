@@ -5,9 +5,12 @@ import { WalletService } from './wallet.service';
 import { RedisService } from '../common/services/redis.service';
 import { SquadService } from '../common/services/squad.service';
 import { ActivityLogService } from '../common/services/activity-log.service';
+import { NotificationsModule } from '../notifications/notifications.module';
+
+
 
 @Module({
-  imports: [AuthModule],
+  imports: [AuthModule, NotificationsModule],
   controllers: [WalletController],
   providers: [
     WalletService,

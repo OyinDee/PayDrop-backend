@@ -81,8 +81,11 @@ export class NotificationsController {
   })
   @ApiResponse({ status: 404, description: 'Notification not found' })
   @ApiResponse({ status: 401, description: 'Unauthorized' })
-  async markAsRead(@Param('id') id: string) {
-    return this.notificationsService.markAsRead(id);
+  async markAsRead(
+    @Param('id') id: string,
+    @CurrentUser('sub') userId: string,
+  ) {
+    return this.notificationsService.markAsRead(id, userId);
   }
 
   @Patch('read-all')
@@ -101,3 +104,4 @@ export class NotificationsController {
     return this.notificationsService.markAllAsRead(userId);
   }
 }
+
