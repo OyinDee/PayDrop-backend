@@ -715,28 +715,54 @@ export class TransactionsService {
     };
   }
 
-  async getTransactions(userId: string, page: number = 1, limit: number = 20) {
-    const skip = (page - 1) * limit;
-
-    const [transactions, total] = await Promise.all([
-      this.prisma.transaction.findMany({
-        where: { OR: [{ sender_id: userId }, { recipient_id: userId }] },
-        skip,
-        take: limit,
-        orderBy: { created_at: 'desc' },
-      }),
-      this.prisma.transaction.count({
-        where: { OR: [{ sender_id: userId }, { recipient_id: userId }] },
-      }),
-    ]);
-
-    return {
-      transactions: transactions.map((tx: any) => this.formatTx(tx, userId)),
-      total,
-      page,
-      limit,
-    };
+async getTransactions(userId: string, page: number = 1, limit: number = 20) {
+  // Default page to 1 if less than 1
+  if (page < 1) {
+    page = 1;
   }
+  
+  // Clamp limit between 1 and 100
+  if (limit < 1 || limit > 100) {
+    limit = Math.min(Math.max(limit, 1), 100);
+  }
+
+  const skip = (page - 1) * limit;
+
+  const [transactions, total] = await Promise.all([
+    this.prisma.transaction.findMany({
+      where: {
+        OR: [{ sender_id: userId }, { recipient_id: userId }],
+      },
+      skip,
+      take: limit,
+      orderBy: { created_at: 'desc' },
+    }),
+    this.prisma.transaction.count({
+      where: {
+        OR: [{ sender_id: userId }, { recipient_id: userId }],
+      },
+    }),
+  ]);
+
+  return {
+    transactions: transactions.map((tx: any) => ({
+      id: tx.id,
+      sender_id: tx.sender_id,
+      recipient_id: tx.recipient_id,
+      amount: tx.amount,
+      status: tx.status,
+      note: tx.note,
+      squad_ref: tx.squad_ref,
+      fraud_score: tx.fraud_score,
+      fraud_verdict: tx.verdict,
+      createdAt: tx.created_at,
+      updatedAt: tx.updated_at,
+    })),
+    total,
+    page,
+    limit,
+  };
+}
 
   async getTransaction(transactionId: string, viewerUserId?: string) {
     const transaction = await this.prisma.transaction.findUnique({

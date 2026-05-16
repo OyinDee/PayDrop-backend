@@ -26,7 +26,7 @@ export class FraudService {
   private readonly fraudServiceUrl: string;
   private readonly scorePath = '/score';
   private readonly logger = new Logger(FraudService.name);
-  private readonly timeout = 3000; // 3 seconds
+  private readonly timeout = 10000; // 3 seconds
 
   constructor(private configService: ConfigService) {
     this.fraudServiceUrl =
