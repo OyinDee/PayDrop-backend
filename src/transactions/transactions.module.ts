@@ -7,6 +7,7 @@ import { SquadService } from '../common/services/squad.service';
 import { ActivityLogService } from '../common/services/activity-log.service';
 import { AuthModule } from '../auth/auth.module';
 import { WalletModule } from '../wallet/wallet.module';
+import { AutoCreditService } from './auto-credit.service';
 
 @Module({
   imports: [AuthModule, WalletModule],
@@ -16,6 +17,7 @@ import { WalletModule } from '../wallet/wallet.module';
     RedisService,
     FraudService,
     SquadService,
+    AutoCreditService,
     ActivityLogService,
   ],
   exports: [TransactionsService],

@@ -5,6 +5,7 @@ import { RedisService } from '../common/services/redis.service';
 import { SquadService } from '../common/services/squad.service';
 import { ActivityLogService } from '../common/services/activity-log.service';
 import { WalletModule } from '../wallet/wallet.module';
+import { JwtService } from '@nestjs/jwt';
 
 @Module({
   imports: [WalletModule],
@@ -14,6 +15,7 @@ import { WalletModule } from '../wallet/wallet.module';
     RedisService,
     SquadService,
     ActivityLogService,
+    JwtService
   ],
 })
 export class WebhooksModule {}
