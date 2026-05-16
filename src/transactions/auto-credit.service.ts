@@ -3,7 +3,7 @@ import { Cron } from '@nestjs/schedule';
 import { PrismaService } from '../common/prisma/prisma.service';
 import { SquadService } from '../common/services/squad.service';
 import { WalletService } from '../wallet/wallet.service';
-import { ActivityLogService } from '../common/services';
+import { ActivityLogService } from '../common/services/activity-log.service';
 
 /**
  * Auto-credit service that polls for pending transfers
@@ -86,14 +86,29 @@ export class AutoCreditService {
           }
         } catch (error) {
           const err = error as Error;
-          this.logger.error(
-            JSON.stringify({
-              event: 'auto_credit_requery_failed',
-              transaction_id: tx.id,
-              squad_ref: tx.squad_ref,
-              error: err.message,
-            }),
-          );
+          
+          // Check if it's an auth error - might be service issue
+          const errMsg = err.message || '';
+          if (errMsg.includes('403') || errMsg.includes('Authentication')) {
+            this.logger.warn(
+              JSON.stringify({
+                event: 'auto_credit_squad_auth_error',
+                transaction_id: tx.id,
+                squad_ref: tx.squad_ref,
+                error: errMsg,
+                note: 'Check Squad API credentials - this may be a temporary service issue',
+              }),
+            );
+          } else {
+            this.logger.error(
+              JSON.stringify({
+                event: 'auto_credit_requery_failed',
+                transaction_id: tx.id,
+                squad_ref: tx.squad_ref,
+                error: errMsg,
+              }),
+            );
+          }
         }
       }
     } catch (error) {
@@ -247,5 +262,41 @@ export class AutoCreditService {
       statusLower.includes('decline') ||
       statusLower.includes('reversed')
     );
+  }
+
+  /**
+   * Manual endpoint to force-credit a pending transfer
+   * Use this if you know Squad says it's successful but auto-credit can't query
+   */
+  async manualCreditPending(transactionId: string): Promise<any> {
+    const tx = await this.prisma.transaction.findUnique({
+      where: { id: transactionId },
+      include: {
+        sender: { select: { id: true } },
+        recipient: { select: { id: true } },
+      },
+    });
+
+    if (!tx) {
+      return { error: 'Transaction not found' };
+    }
+
+    if (tx.status === 'COMPLETED') {
+      return { already: 'completed', status: tx.status };
+    }
+
+    if (tx.status !== 'PENDING') {
+      return { error: 'Transaction is not PENDING', status: tx.status };
+    }
+
+    // Force credit
+    await this.creditPendingTransfer(tx);
+
+    const updated = await this.prisma.transaction.findUnique({
+      where: { id: transactionId },
+      select: { status: true },
+    });
+
+    return { credited: true, new_status: updated?.status };
   }
 }
