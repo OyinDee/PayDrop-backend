@@ -19,7 +19,7 @@ import { resolvePayoutNipCode } from '../common/utils/squad-bank-code.util';
 @Injectable()
 export class TransactionsService {
   private readonly logger = new Logger(TransactionsService.name);
-  private readonly CONFIRM_TTL_SECONDS = 900; // 15min
+  private readonly CONFIRM_TTL_SECONDS = 900; // 15 min
 
   constructor(
     private readonly prisma: PrismaService,
@@ -30,7 +30,11 @@ export class TransactionsService {
     private readonly wallet: WalletService,
   ) {}
 
-  /** Normalize Squad payout requery/webhook-ish status labels. */
+  // ─────────────────────────────────────────────────────────────
+  // Private helpers
+  // ─────────────────────────────────────────────────────────────
+
+  /** Normalise Squad payout requery/webhook-ish status labels. */
   private classifySquadPayoutSettlement(
     label: string,
     raw: Record<string, unknown>,
@@ -61,9 +65,7 @@ export class TransactionsService {
     }
 
     const rc = raw?.response_code;
-    if (rc === '00' || rc === 0 || rc === '0') {
-      return 'success';
-    }
+    if (rc === '00' || rc === 0 || rc === '0') return 'success';
 
     return 'pending';
   }
@@ -124,17 +126,53 @@ export class TransactionsService {
     };
   }
 
+  /**
+   * Shape a transaction row for API responses.
+   * Pass viewerUserId to get a 'debit' | 'credit' direction field.
+   */
+  private formatTx(tx: any, viewerUserId?: string) {
+    return {
+      id: tx.id,
+      sender_id: tx.sender_id,
+      recipient_id: tx.recipient_id,
+      amount: tx.amount,
+      type: tx.type,
+      status: tx.status,
+      /**
+       * direction:
+       *   'debit'  – money left the viewer's wallet (they are the sender)
+       *   'credit' – money entered the viewer's wallet (they are the recipient)
+       *   null     – viewer context unknown (single-tx lookup without auth context)
+       */
+      direction: viewerUserId
+        ? tx.sender_id === viewerUserId
+          ? 'debit'
+          : 'credit'
+        : null,
+      note: tx.note,
+      squad_ref: tx.squad_ref,
+      fraud_score: tx.fraud_score,
+      fraud_verdict: tx.verdict,
+      createdAt: tx.created_at,
+      updatedAt: tx.updated_at,
+    };
+  }
+
+  // ─────────────────────────────────────────────────────────────
+  // Public methods
+  // ─────────────────────────────────────────────────────────────
+
   async lookupRecipientSquadPayoutAccount(recipientId: string) {
     const recipient = await this.prisma.user.findUnique({
       where: { id: recipientId },
     });
-    if (!recipient) {
-      throw new NotFoundException('Recipient not found');
-    }
+    if (!recipient) throw new NotFoundException('Recipient not found');
+
     const { lookup, recipientName, nameMatches, nip, lookupSource } =
       await this.resolveRecipientPayoutDetails(recipient, undefined, {
         recipient_id: recipientId,
       });
+
     return {
       recipient_id: recipientId,
       squad_virtual_account: recipient.squad_virtual_account,
@@ -154,7 +192,9 @@ export class TransactionsService {
       throw new NotFoundException('Transaction not found');
     }
     if (!tx.squad_ref) {
-      throw new BadRequestException('Transaction has no Squad payout reference yet');
+      throw new BadRequestException(
+        'Transaction has no Squad payout reference yet',
+      );
     }
 
     const result = await this.squad.requeryTransfer(tx.squad_ref);
@@ -171,8 +211,7 @@ export class TransactionsService {
 
     if (tx.type === 'TRANSFER') {
       if (settlement === 'success') {
-        const applied =
-          await this.wallet.completePendingP2pTransfer(tx.id);
+        const applied = await this.wallet.completePendingP2pTransfer(tx.id);
         if (applied) {
           paydrop_settlement = 'completed';
           await this.redis.set(`squad_ref:${tx.squad_ref}`, '1', 86400);
@@ -199,9 +238,8 @@ export class TransactionsService {
             await this.redis.set(`squad_ref:${tx.squad_ref}`, '1', 86400);
           }
         }
-      } else {
-        paydrop_settlement = 'unchanged';
       }
+      // else: settlement === 'pending' → paydrop_settlement stays 'unchanged'
     } else {
       paydrop_settlement = 'not_applicable';
     }
@@ -238,9 +276,7 @@ export class TransactionsService {
       where: { id: recipientId },
       select: { id: true },
     });
-    if (!recipient) {
-      throw new NotFoundException('Recipient not found');
-    }
+    if (!recipient) throw new NotFoundException('Recipient not found');
 
     const normalizedUnique = [
       ...new Set(
@@ -252,7 +288,9 @@ export class TransactionsService {
     ];
 
     if (normalizedUnique.length === 0) {
-      throw new BadRequestException('contacts must include at least one valid phone');
+      throw new BadRequestException(
+        'contacts must include at least one valid phone',
+      );
     }
 
     const matchedUsers = await this.prisma.user.findMany({
@@ -260,7 +298,9 @@ export class TransactionsService {
       select: { id: true, phone: true },
     });
 
-    const matchedIds = [...new Set(matchedUsers.map((u: { id: string }) => u.id))];
+    const matchedIds = [
+      ...new Set(matchedUsers.map((u: { id: string }) => u.id)),
+    ];
     const friendCandidateIds = matchedIds.filter(
       (id) => id !== requesterUserId && id !== recipientId,
     );
@@ -300,10 +340,12 @@ export class TransactionsService {
     }
 
     const idempotencyKey = uuidv4();
-
     const amountKobo = BigInt(amount);
+
     if (amountKobo <= 0n) {
-      throw new BadRequestException('Amount must be greater than zero (value is in kobo)');
+      throw new BadRequestException(
+        'Amount must be greater than zero (value is in kobo)',
+      );
     }
 
     const sender = await this.prisma.user.findUnique({
@@ -317,8 +359,6 @@ export class TransactionsService {
     });
     if (!recipient) throw new NotFoundException('Recipient not found');
 
-    // Pre-check 2 — Balance (and pessimistic lock inside the transaction)
-    // Pre-check 3 — Fraud score (fail open)
     const fraud = await this.fraud.scoreTransaction({
       idempotency_key: idempotencyKey,
       sender_id: senderId,
@@ -332,6 +372,7 @@ export class TransactionsService {
       reason: fraud.reason,
     });
 
+    // ── BLOCK ──────────────────────────────────────────────────
     if (fraud.verdict === 'BLOCK') {
       await this.prisma.transaction.create({
         data: {
@@ -360,6 +401,7 @@ export class TransactionsService {
       });
     }
 
+    // ── FLAG ───────────────────────────────────────────────────
     if (fraud.verdict === 'FLAG') {
       const tx = await this.prisma.transaction.create({
         data: {
@@ -377,7 +419,10 @@ export class TransactionsService {
       });
 
       const confirmToken = uuidv4();
-      const { nip: recipientNipCode } = this.resolveRecipientNip(recipient, nipCode);
+      const { nip: recipientNipCode } = this.resolveRecipientNip(
+        recipient,
+        nipCode,
+      );
       await this.redis.set(
         `confirm:${confirmToken}`,
         {
@@ -412,9 +457,8 @@ export class TransactionsService {
       };
     }
 
-    // ALLOW path: lock wallet row, re-check balance, call Squad, create PENDING tx.
+    // ── ALLOW: pessimistic lock → Squad → create PENDING ──────
     const created = (await this.prisma.$transaction(async (tx: any) => {
-      // Pessimistic lock to prevent double spend.
       await tx.$queryRaw`SELECT 1 FROM wallets WHERE user_id = ${senderId} FOR UPDATE`;
 
       const lockedWallet = await tx.wallet.findUnique({
@@ -465,6 +509,15 @@ export class TransactionsService {
       };
     })) as { txRow: any; squadRef: string; nipRef?: string };
 
+    // TRANSFER_SENT – logged for the sender after the Squad call succeeds
+    await this.activityLog.log(senderId, 'TRANSFER_SENT', {
+      transaction_id: created.txRow.id,
+      recipient_id: recipientId,
+      amount: Number(amountKobo),
+      squad_ref: created.squadRef,
+    });
+
+    // TRANSFER_INITIATED – kept for backwards compatibility / audit trail
     await this.activityLog.log(senderId, 'TRANSFER_INITIATED', {
       transaction_id: created.txRow.id,
       recipient_id: recipientId,
@@ -483,19 +536,30 @@ export class TransactionsService {
     };
   }
 
-  async confirmTransfer(senderId: string, transactionId: string, confirmToken: string) {
+  async confirmTransfer(
+    senderId: string,
+    transactionId: string,
+    confirmToken: string,
+  ) {
     const payload = await this.redis.get<any>(`confirm:${confirmToken}`);
     if (!payload) {
       throw new UnauthorizedException('Invalid or expired confirm token');
     }
-    if (payload.transaction_id !== transactionId || payload.sender_id !== senderId) {
+    if (
+      payload.transaction_id !== transactionId ||
+      payload.sender_id !== senderId
+    ) {
       throw new UnauthorizedException('Confirm token mismatch');
     }
 
     await this.redis.del(`confirm:${confirmToken}`);
 
-    const tx = await this.prisma.transaction.findUnique({ where: { id: transactionId } });
+    const tx = await this.prisma.transaction.findUnique({
+      where: { id: transactionId },
+    });
     if (!tx) throw new NotFoundException('Transaction not found');
+
+    // If already progressed past PENDING_REVIEW (e.g. re-submit after success), return current state
     if (tx.status !== 'PENDING_REVIEW') {
       return {
         idempotency_key: tx.idempotency_key,
@@ -507,8 +571,9 @@ export class TransactionsService {
       };
     }
 
-    // Re-run ALLOW path initiation (same logic as transfer allow, but use existing tx row + idempotency_key)
-    const recipient = await this.prisma.user.findUnique({ where: { id: tx.recipient_id || '' } });
+    const recipient = await this.prisma.user.findUnique({
+      where: { id: tx.recipient_id || '' },
+    });
     if (!recipient) throw new NotFoundException('Recipient not found');
 
     const nipOverride = (payload as any)?.nip_code;
@@ -519,7 +584,10 @@ export class TransactionsService {
 
     const initiated = (await this.prisma.$transaction(async (p: any) => {
       await p.$queryRaw`SELECT 1 FROM wallets WHERE user_id = ${senderId} FOR UPDATE`;
-      const lockedWallet = await p.wallet.findUnique({ where: { user_id: senderId } });
+
+      const lockedWallet = await p.wallet.findUnique({
+        where: { user_id: senderId },
+      });
       if (!lockedWallet || lockedWallet.balance < tx.amount) {
         throw new BadRequestException('Insufficient funds');
       }
@@ -558,6 +626,13 @@ export class TransactionsService {
       squad_ref: initiated.squadRef,
     });
 
+    // Also log TRANSFER_SENT now that the flagged transfer has been confirmed and dispatched
+    await this.activityLog.log(senderId, 'TRANSFER_SENT', {
+      transaction_id: tx.id,
+      squad_ref: initiated.squadRef,
+      via: 'flag_confirm',
+    });
+
     return {
       idempotency_key: initiated.updated.idempotency_key,
       transaction_id: initiated.updated.id,
@@ -568,75 +643,55 @@ export class TransactionsService {
     };
   }
 
-  async getTransactions(userId: string, page: number = 1, limit: number = 20) {
+  async getTransactions(
+    userId: string,
+    page: number = 1,
+    limit: number = 20,
+  ) {
     const skip = (page - 1) * limit;
 
-    const transactions = await this.prisma.transaction.findMany({
-      where: {
-        OR: [{ sender_id: userId }, { recipient_id: userId }],
-      },
-      skip,
-      take: limit,
-      orderBy: { created_at: 'desc' },
-    });
-
-    const total = await this.prisma.transaction.count({
-      where: {
-        OR: [{ sender_id: userId }, { recipient_id: userId }],
-      },
-    });
+    const [transactions, total] = await Promise.all([
+      this.prisma.transaction.findMany({
+        where: {
+          OR: [{ sender_id: userId }, { recipient_id: userId }],
+        },
+        skip,
+        take: limit,
+        orderBy: { created_at: 'desc' },
+      }),
+      this.prisma.transaction.count({
+        where: {
+          OR: [{ sender_id: userId }, { recipient_id: userId }],
+        },
+      }),
+    ]);
 
     return {
-      transactions: transactions.map((tx: any) => ({
-        id: tx.id,
-        sender_id: tx.sender_id,
-        recipient_id: tx.recipient_id,
-        amount: tx.amount,
-        status: tx.status,
-        note: tx.note,
-        squad_ref: tx.squad_ref,
-        fraud_score: tx.fraud_score,
-        fraud_verdict: tx.verdict,
-        createdAt: tx.created_at,
-        updatedAt: tx.updated_at,
-      })),
+      transactions: transactions.map((tx: any) => this.formatTx(tx, userId)),
       total,
       page,
       limit,
     };
   }
 
-  async getTransaction(transactionId: string) {
+  /**
+   * @param viewerUserId  Pass the authenticated user's ID to get a direction field.
+   *                      Omit (or pass undefined) for admin/internal lookups.
+   */
+  async getTransaction(transactionId: string, viewerUserId?: string) {
     const transaction = await this.prisma.transaction.findUnique({
       where: { id: transactionId },
     });
+    if (!transaction) throw new NotFoundException('Transaction not found');
 
-    if (!transaction) {
-      throw new NotFoundException('Transaction not found');
-    }
-
-    return {
-      id: transaction.id,
-      sender_id: transaction.sender_id,
-      recipient_id: transaction.recipient_id,
-      amount: transaction.amount,
-      status: transaction.status,
-      note: transaction.note,
-      squad_ref: transaction.squad_ref,
-      fraud_score: transaction.fraud_score,
-      fraud_verdict: transaction.verdict,
-      createdAt: transaction.created_at,
-      updatedAt: transaction.updated_at,
-    };
+    return this.formatTx(transaction, viewerUserId);
   }
 
   async getFraudDetail(transactionId: string) {
     const transaction = await this.prisma.transaction.findUnique({
       where: { id: transactionId },
     });
-    if (!transaction) {
-      throw new NotFoundException('Transaction not found');
-    }
+    if (!transaction) throw new NotFoundException('Transaction not found');
 
     const fraudEvent = await this.prisma.fraudEvent.findFirst({
       where: { transaction_id: transactionId },
@@ -683,8 +738,7 @@ export class TransactionsService {
         features: {} as Record<string, unknown>,
         source: 'transaction_snapshot',
         scored_at: transaction.created_at.toISOString(),
-        note:
-          'Snapshot from when this transfer was scored (POST /transactions/transfer).',
+        note: 'Snapshot from when this transfer was scored (POST /transactions/transfer).',
       };
     }
 
