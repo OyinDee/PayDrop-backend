@@ -1,0 +1,20 @@
+services:
+  - type: web
+    name: paydrop-api
+    runtime: node
+    plan: free
+    # nest build needs the devDependencies (typescript, @nestjs/cli, ts-loader).
+    buildCommand: npm install --include=dev && npm run build
+    startCommand: npm start
+    envVars:
+      - key: NODE_VERSION
+        value: 22.15.0
+      - key: NODE_ENV
+        value: production
+      # TEMPORARY while testing: enables /auth/test-login and skips SMS.
+      # Remove this (or set it to false) before a real launch.
+      - key: AUTH_TEST_MODE
+        value: "true"
+      # Set these in the Render dashboard, not in git:
+      # DATABASE_URL, REDIS_URL, JWT_ACCESS_SECRET, JWT_REFRESH_SECRET,
+      # SQUAD_*, FIREBASE_*, TERMII_*, FRAUD_SERVICE_URL
