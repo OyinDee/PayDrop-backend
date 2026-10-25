@@ -130,6 +130,8 @@ All API responses follow this standard format:
 
 - `POST /request-otp` - Send OTP to phone via SMS
 - `POST /verify-otp` - Verify OTP and get access/refresh tokens
+- `POST /test-login` - TEST ONLY: log in as a preset account, no SMS (`AUTH_TEST_MODE`)
+- `GET /test-accounts` - TEST ONLY: list the preset accounts and the fixed OTP
 - `POST /refresh` - Exchange refresh token for new access token
 - `POST /logout` - Invalidate refresh token
 

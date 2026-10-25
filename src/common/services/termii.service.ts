@@ -3,6 +3,10 @@ import { ConfigService } from '@nestjs/config';
 import axios from 'axios';
 import { RedisService } from './redis.service';
 import crypto from 'crypto';
+import {
+  isTestAuthEnabled,
+  TEST_AUTH_OTP,
+} from '../constants/test-auth.constants';
 
 export interface OtpVerifyResponse {
   verified: boolean;
@@ -20,6 +24,8 @@ export class TermiiService {
   private readonly senderId?: string;
   private readonly baseUrl: string;
   private readonly otpTtlSeconds: number;
+  private readonly testMode: boolean;
+  private readonly testOtp: string;
 
   constructor(
     private configService: ConfigService,
@@ -36,7 +42,18 @@ export class TermiiService {
       this.configService.get<string>('OTP_TTL_SECONDS') || 600,
     );
 
-    if (!this.apiKey) {
+    if (isTestAuthEnabled()) {
+      this.testMode = true;
+      this.testOtp = TEST_AUTH_OTP;
+      console.warn(
+        `[AUTH TEST MODE] SMS is disabled. OTP ${TEST_AUTH_OTP} is accepted for every phone number.`,
+      );
+    } else {
+      this.testMode = false;
+      this.testOtp = '';
+    }
+
+    if (!this.apiKey && !this.testMode) {
       throw new Error('TERMII_API_KEY is not configured');
     }
   }
@@ -66,6 +83,20 @@ export class TermiiService {
    * Send OTP to phone number
    */
   async sendOtp(phone: string): Promise<OtpSendResponse> {
+    if (this.testMode) {
+      // No SMS in test mode. Store the fixed test OTP hash so the normal path still works.
+      await this.redisService.set(
+        this.otpKey(phone),
+        this.otpHash(phone, this.testOtp),
+        this.otpTtlSeconds,
+      );
+      console.log(`[AUTH TEST MODE] OTP for ${phone} is ${this.testOtp}`);
+      return {
+        success: true,
+        message: 'Test mode: SMS skipped, use the fixed test OTP',
+      };
+    }
+
     try {
       const otp = this.generateOtp(6);
 
@@ -114,6 +145,11 @@ export class TermiiService {
    * Verify OTP submitted by user
    */
   async verifyOtp(phone: string, otp: string): Promise<OtpVerifyResponse> {
+    if (this.testMode && otp?.trim() === this.testOtp) {
+      await this.redisService.del(this.otpKey(phone));
+      return { verified: true, message: 'Test mode OTP verified' };
+    }
+
     try {
       const stored = await this.redisService.get<string>(this.otpKey(phone));
       if (!stored) {

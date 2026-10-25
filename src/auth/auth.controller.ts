@@ -1,4 +1,4 @@
-import { Controller, Post, Body, UseGuards } from '@nestjs/common';
+import { Controller, Post, Get, Body, UseGuards } from '@nestjs/common';
 import {
   ApiTags,
   ApiOperation,
@@ -12,6 +12,7 @@ import { CurrentUser } from '../common/decorators/current-user.decorator';
 import { JwtAuthGuard } from '../common/guards/jwt-auth.guard';
 import {
   RequestOtpDto,
+  TestLoginDto,
   VerifyOtpDto,
   RefreshTokenDto,
   OtpResponseDto,
@@ -58,6 +59,32 @@ export class AuthController {
   @ApiResponse({ status: 401, description: 'OTP verification failed' })
   async verifyOtp(@Body() body: VerifyOtpDto): Promise<VerifyOtpResponseDto> {
     return await this.authService.verifyOtp(body);
+  }
+
+  @Post('test-login')
+  @ApiOperation({
+    summary: 'TEST ONLY - log in as a preset account (no SMS)',
+    description:
+      'Disabled unless AUTH_TEST_MODE is enabled. Signs in as one of 3 preset test accounts and creates the user + wallet on first use. No OTP, no BVN, no Squad virtual account.',
+  })
+  @ApiBody({ type: TestLoginDto })
+  @ApiResponse({
+    status: 200,
+    description: 'Tokens issued',
+    type: VerifyOtpResponseDto,
+  })
+  @ApiResponse({ status: 404, description: 'Test auth is disabled' })
+  async testLogin(@Body() body: TestLoginDto): Promise<VerifyOtpResponseDto> {
+    return await this.authService.testLogin(body?.account);
+  }
+
+  @Get('test-accounts')
+  @ApiOperation({
+    summary: 'TEST ONLY - list preset test accounts and the fixed OTP',
+    description: 'Disabled unless AUTH_TEST_MODE is enabled.',
+  })
+  async testAccounts(): Promise<any> {
+    return this.authService.listTestAccounts();
   }
 
   @Post('refresh')

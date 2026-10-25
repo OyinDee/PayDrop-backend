@@ -15,6 +15,12 @@ import { ActivityLogService } from '../common/services/activity-log.service';
 import { VerifyOtpDto, RefreshTokenDto, OtpIntent } from './dto/auth.dto';
 import { normalizeNgPhone } from '../common/utils/phone.util';
 import { buildDefaultAvatarUrl, resolveUserAvatarUrl } from '../common/utils/avatar.util';
+import {
+  isTestAuthEnabled,
+  resolveTestAccount,
+  TEST_ACCOUNTS,
+  TEST_AUTH_OTP,
+} from '../common/constants/test-auth.constants';
 // Use enum values as strings to avoid relying on generated prisma client exports
 
 @Injectable()
@@ -60,7 +66,7 @@ export class AuthService {
     const rateLimitKey = `otp_rate:${normalizedPhone}`;
     const attempts = await this.redisService.get<number>(rateLimitKey);
 
-    if (attempts && attempts >= this.OTP_RATE_LIMIT) {
+    if (!isTestAuthEnabled() && attempts && attempts >= this.OTP_RATE_LIMIT) {
       throw new BadRequestException(
         'Too many OTP requests. Try again in 10 minutes.',
       );
@@ -297,6 +303,106 @@ export class AuthService {
         'Signup failed: ' + message,
       );
     }
+  }
+
+  /**
+   * TEST ONLY - sign in as one of the preset accounts, no OTP.
+   * Creates the user (and wallet) on first use. Disabled unless test auth is on.
+   */
+  async testLogin(account?: string): Promise<any> {
+    if (!isTestAuthEnabled()) {
+      // 404 rather than 403 so the route is not advertised on real deployments.
+      throw new NotFoundException('Not found');
+    }
+
+    const preset = resolveTestAccount(account);
+    if (!preset) {
+      throw new BadRequestException(
+        'Unknown test account. Use 1, 2, 3, a phone number, or a username from GET /auth/test-accounts.',
+      );
+    }
+
+    let user = await (this.prisma as any).user.findUnique({
+      where: { phone: preset.phone },
+      include: { wallet: true },
+    });
+
+    if (!user) {
+      try {
+        user = await (this.prisma as any).user.create({
+          data: {
+            phone: preset.phone,
+            username: preset.username,
+            first_name: preset.first_name,
+            last_name: preset.last_name,
+            email: preset.email,
+            avatar_url: buildDefaultAvatarUrl(preset.username),
+            kyc_verified: false,
+          },
+          include: { wallet: true },
+        });
+      } catch (error: any) {
+        if (error?.code !== 'P2002') {
+          throw error;
+        }
+        // Concurrent creation or username already used by another phone: reuse the row.
+        user = await (this.prisma as any).user.findFirst({
+          where: { OR: [{ phone: preset.phone }, { username: preset.username }] },
+          include: { wallet: true },
+        });
+        if (!user) {
+          throw new ConflictException('Could not provision test account');
+        }
+      }
+    }
+
+    if (!user.wallet) {
+      const wallet = await (this.prisma as any).wallet.create({
+        data: {
+          user_id: user.id,
+          balance: 0n,
+          currency: 'NGN',
+        },
+      });
+      user.wallet = wallet;
+    }
+
+    const accessToken = this.jwtService.generateAccessToken(user.id, user.phone);
+    const refreshToken = uuidv4();
+    await this.redisService.set(
+      `refresh:${refreshToken}`,
+      user.id,
+      this.REFRESH_TOKEN_TTL,
+    );
+
+    await this.activityLog.log(user.id, 'LOGIN_SUCCESS', {
+      test_mode: true,
+      test_account: preset.index,
+    });
+
+    return {
+      access_token: accessToken,
+      refresh_token: refreshToken,
+      user: this.formatUserResponse(user),
+      wallet: {
+        balance: user.wallet?.balance || 0n,
+        currency: 'NGN',
+      },
+    };
+  }
+
+  /**
+   * TEST ONLY - list the preset accounts and the fixed OTP.
+   */
+  listTestAccounts(): any {
+    if (!isTestAuthEnabled()) {
+      throw new NotFoundException('Not found');
+    }
+    return {
+      test_mode: true,
+      otp: TEST_AUTH_OTP,
+      accounts: TEST_ACCOUNTS,
+    };
   }
 
   /**

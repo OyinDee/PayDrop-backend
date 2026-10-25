@@ -1,4 +1,5 @@
 import { ApiProperty } from '@nestjs/swagger';
+import { Transform } from 'class-transformer';
 import {
   IsString,
   IsPhoneNumber,
@@ -134,6 +135,19 @@ export class VerifyOtpDto {
   @IsOptional()
   @IsUrl()
   avatar_url?: string;
+}
+
+export class TestLoginDto {
+  @ApiProperty({
+    description:
+      'Test account selector: 1, 2, or 3, a test phone number, or a test username. Defaults to 1.',
+    example: '1',
+    required: false,
+  })
+  @IsOptional()
+  @Transform(({ value }) => (value === undefined || value === null ? value : String(value)))
+  @IsString()
+  account?: string;
 }
 
 export class RefreshTokenDto {
