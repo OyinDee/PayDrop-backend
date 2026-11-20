@@ -103,9 +103,13 @@ export class HttpExceptionFilter implements ExceptionFilter {
       timestamp: new Date().toISOString(),
     };
 
-    this.logger.error(
-      `${request?.method} ${request?.url} -> ${status} ${body.code}`,
-    );
+    const line = `${request?.method} ${request?.url} -> ${status} ${body.code}`;
+
+    if (status >= 500) {
+      this.logger.error(line);
+    } else {
+      this.logger.warn(line);
+    }
 
     (response as any).status(status).json(errorResponse);
   }

@@ -12,6 +12,7 @@ import { TransactionsModule } from './transactions/transactions.module';
 import { NotificationsModule } from './notifications/notifications.module';
 import { WebhooksModule } from './webhooks/webhooks.module';
 import { KycModule } from './kyc/kyc.module';
+import { AppController } from './app.controller';
 
 @Module({
   imports: [
@@ -34,5 +35,6 @@ import { KycModule } from './kyc/kyc.module';
     WebhooksModule,
     KycModule,
   ],
+  controllers: [AppController],
 })
 export class AppModule {}

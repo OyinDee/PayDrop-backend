@@ -31,7 +31,9 @@ async function bootstrap() {
   }));
 
   app.enableCors();
-  app.setGlobalPrefix('api/v1');
+  app.setGlobalPrefix('api/v1', {
+    exclude: ['/', 'health'],
+  });
 
   // Notifications ride a plain JSON WebSocket at /ws (no Socket.IO client).
   app.useWebSocketAdapter(new WsAdapter(app));
