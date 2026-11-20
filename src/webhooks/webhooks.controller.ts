@@ -1,5 +1,17 @@
-import { Controller, Post, Get, Body, Headers, Req, Query, Param, Logger } from '@nestjs/common';
+import {
+  Controller,
+  Post,
+  Get,
+  Body,
+  Headers,
+  Req,
+  Query,
+  Param,
+  Logger,
+  UseGuards,
+} from '@nestjs/common';
 import { ApiTags, ApiOperation, ApiResponse, ApiHeader, ApiBody, ApiParam } from '@nestjs/swagger';
+import { DebugEndpointsGuard } from '../common/guards/debug-endpoints.guard';
 import { WebhooksService } from './webhooks.service';
 import { Request } from 'express';
 
@@ -99,6 +111,7 @@ export class WebhooksController {
   }
 
   @Get('pending-transfers')
+  @UseGuards(DebugEndpointsGuard)
   @ApiOperation({
     summary: '[DEBUG] Get Pending Transfers',
     description: 'List transfers stuck in PENDING state (waiting for webhook). Internal endpoint only.',
@@ -109,6 +122,7 @@ export class WebhooksController {
   }
 
   @Get('find/:squadRef')
+  @UseGuards(DebugEndpointsGuard)
   @ApiParam({
     name: 'squadRef',
     description: 'Squad reference ID (e.g., SBPJ4U4VU6_pd_...)',

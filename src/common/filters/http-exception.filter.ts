@@ -7,6 +7,31 @@ import {
   Logger,
 } from '@nestjs/common';
 import { Request, Response } from 'express';
+import { isApiErrorBody } from '../errors/api-error';
+
+/** Fallback code for exceptions that do not carry one (framework-internal throws). */
+function defaultCodeFor(status: number): string {
+  switch (status) {
+    case 400:
+      return 'VALIDATION_ERROR';
+    case 401:
+      return 'UNAUTHORIZED';
+    case 403:
+      return 'FORBIDDEN';
+    case 404:
+      return 'NOT_FOUND';
+    case 409:
+      return 'CONFLICT';
+    case 410:
+      return 'GONE';
+    case 422:
+      return 'UNPROCESSABLE_ENTITY';
+    case 429:
+      return 'RATE_LIMITED';
+    default:
+      return status >= 500 ? 'INTERNAL_ERROR' : 'REQUEST_FAILED';
+  }
+}
 
 @Catch()
 export class HttpExceptionFilter implements ExceptionFilter {
@@ -22,41 +47,64 @@ export class HttpExceptionFilter implements ExceptionFilter {
     const status = isHttpException
       ? exception.getStatus()
       : HttpStatus.INTERNAL_SERVER_ERROR;
-    const exceptionResponse = isHttpException
-      ? exception.getResponse()
-      : 'Internal server error';
 
-    const nonHttpMessage =
-      exception instanceof Error
-        ? exception.message
-        : exception
-          ? String(exception)
-          : 'Internal server error';
+    const payload = isHttpException ? exception.getResponse() : null;
+    const body =
+      typeof payload === 'object' && payload ? (payload as any) : null;
 
-    const message =
-      typeof exceptionResponse === 'object' && exceptionResponse && 'message' in exceptionResponse
-        ? (exceptionResponse as any).message
+    // Already-shaped API error: pass code/details/message through untouched.
+    if (isApiErrorBody(body)) {
+      return this.send(response, request, status, {
+        code: String(body.code),
+        message: String(body.message),
+        details: (body as any).details ?? null,
+      });
+    }
+
+    // class-validator / ValidationPipe: message is an array of field errors.
+    const rawMessage =
+      body && 'message' in body
+        ? (body as any).message
         : isHttpException
-          ? String(exceptionResponse)
-          : isDev
-            ? nonHttpMessage
+          ? payload
+          : isDev && exception instanceof Error
+            ? exception.message
             : 'Internal server error';
 
+    const fieldErrors = Array.isArray(rawMessage)
+      ? rawMessage.map((m) => String(m))
+      : null;
+    const message = Array.isArray(rawMessage)
+      ? String(rawMessage[0] ?? 'Request failed')
+      : String(rawMessage ?? 'Request failed');
+
+    const isValidation = status === 400 && fieldErrors !== null;
+
+    this.send(response, request, status, {
+      code: isValidation ? 'VALIDATION_ERROR' : defaultCodeFor(status),
+      message,
+      details: fieldErrors ? { fields: fieldErrors } : null,
+    });
+  }
+
+  private send(
+    response: Response,
+    request: Request,
+    status: number,
+    body: { code: string; message: string; details: unknown },
+  ) {
     const errorResponse = {
       success: false,
-      message: 'Request failed',
-      data: null,
-      error: Array.isArray(message) ? message.join(', ') : message,
+      code: body.code,
+      message: body.message,
+      details: body.details ?? null,
       statusCode: status,
-      path: request.url,
+      path: request?.url,
       timestamp: new Date().toISOString(),
     };
 
     this.logger.error(
-      `${request.method} ${request.url}`,
-      exception instanceof Error
-        ? `${JSON.stringify(errorResponse)}\n${exception.stack || ''}`
-        : JSON.stringify(errorResponse),
+      `${request?.method} ${request?.url} -> ${status} ${body.code}`,
     );
 
     (response as any).status(status).json(errorResponse);

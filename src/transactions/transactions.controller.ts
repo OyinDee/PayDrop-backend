@@ -1,4 +1,4 @@
-import { Controller, Post, Get, Param, Body, UseGuards, Query } from '@nestjs/common';
+import { Controller, Post, Get, Param, Body, UseGuards, Query, Headers } from '@nestjs/common';
 import { ApiTags, ApiOperation, ApiResponse, ApiBearerAuth, ApiParam, ApiHeader, ApiExtraModels, getSchemaPath } from '@nestjs/swagger';
 import { TransactionsService } from './transactions.service';
 import { CurrentUser } from '../common/decorators/current-user.decorator';
@@ -110,6 +110,7 @@ export class TransactionsController {
   async transfer(
     @CurrentUser('sub') senderId: string,
     @Body() body: TransferDto,
+    @Headers('idempotency-key') idempotencyKey?: string,
   ) {
     return this.transactionsService.transfer(
       senderId,
@@ -117,6 +118,7 @@ export class TransactionsController {
       body.amount,
       body.note,
       body.nip_code,
+      idempotencyKey,
     );
   }
 
@@ -172,6 +174,24 @@ export class TransactionsController {
     return this.transactionsService.getTransactions(userId, page, limit);
   }
 
+  @Get('by-idempotency-key/:key')
+  @UseGuards(JwtAuthGuard)
+  @ApiBearerAuth()
+  @ApiOperation({
+    summary: 'Look up a payment by idempotency key',
+    description:
+      'Recovery route for a dropped connection: returns the true status of the payment created with that key. Scoped to the caller.',
+  })
+  @ApiParam({ name: 'key', description: 'Idempotency-Key sent with the transfer' })
+  @ApiResponse({ status: 200, description: 'Transaction retrieved' })
+  @ApiResponse({ status: 404, description: 'No payment for that key' })
+  async getByIdempotencyKey(
+    @CurrentUser('sub') userId: string,
+    @Param('key') key: string,
+  ) {
+    return this.transactionsService.getTransactionByIdempotencyKey(userId, key);
+  }
+
   @Get(':id')
   @UseGuards(JwtAuthGuard)
   @ApiBearerAuth()
@@ -187,8 +207,11 @@ export class TransactionsController {
   })
   @ApiResponse({ status: 404, description: 'Transaction not found' })
   @ApiResponse({ status: 401, description: 'Unauthorized' })
-  async getTransaction(@Param('id') id: string) {
-    return this.transactionsService.getTransaction(id);
+  async getTransaction(
+    @CurrentUser('sub') userId: string,
+    @Param('id') id: string,
+  ) {
+    return this.transactionsService.getTransaction(id, userId);
   }
 
   @Get(':id/fraud-detail')

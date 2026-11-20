@@ -2,13 +2,10 @@ import { ApiProperty } from '@nestjs/swagger';
 import { Transform } from 'class-transformer';
 import {
   IsString,
-  IsPhoneNumber,
   IsOptional,
   IsUrl,
-  IsEmail,
   IsEnum,
   IsNotEmpty,
-  Matches,
   ValidateIf,
 } from 'class-validator';
 
@@ -18,53 +15,94 @@ export enum OtpIntent {
   SIGNUP = 'signup',
 }
 
+const lower = ({ value }: { value: any }) =>
+  typeof value === 'string' ? value.trim().toLowerCase() : value;
+
+/**
+ * Pre-check identifiers before an OTP is sent. Fields are intentionally
+ * loosely typed: a malformed value answers "invalid" rather than failing the
+ * whole request, so the Register screen can mark that one input.
+ */
+export class CheckAvailabilityDto {
+  @ApiProperty({
+    description: 'Nigerian phone number to check (08123456789 or +2348123456789)',
+    example: '08123456789',
+    required: false,
+  })
+  @IsOptional()
+  @IsString()
+  phone?: string;
+
+  @ApiProperty({
+    description: 'Email address to check',
+    example: 'ada@example.com',
+    required: false,
+  })
+  @IsOptional()
+  @IsString()
+  @Transform(lower)
+  email?: string;
+
+  @ApiProperty({
+    description: 'Username to check (case-insensitive)',
+    example: 'ada_o',
+    required: false,
+  })
+  @IsOptional()
+  @IsString()
+  @Transform(lower)
+  username?: string;
+}
+
 export class RequestOtpDto {
   @ApiProperty({
     description:
-      'login: OTP for existing users only. signup: OTP for new registration only (phone must not already be registered).',
+      'Optional. login: OTP for existing users only. signup: OTP for new registration only (phone must not already be registered). Omit it and the server infers the flow from whether the number has an account.',
     enum: OtpIntent,
     example: OtpIntent.LOGIN,
+    required: false,
   })
+  @IsOptional()
   @IsEnum(OtpIntent)
-  intent: OtpIntent;
+  intent?: OtpIntent;
 
   @ApiProperty({
-    description: 'Nigerian phone number (e.g. 08012345678)',
+    description: 'Nigerian phone number (e.g. 08012345678 or +2348012345678)',
     example: '08012345678',
   })
   @IsString()
-  @IsPhoneNumber('NG')
   phone: string;
 }
 
 export class VerifyOtpDto {
   @ApiProperty({
     description:
-      'Must match the intent used in request-otp. login: existing user only. signup: new user only; requires identity + BVN fields.',
+      'Optional; when omitted it is inferred from whether the number already has an account. signup creates the account with phone, name, username and optional email. No BVN or date of birth is required.',
     enum: OtpIntent,
     example: OtpIntent.LOGIN,
+    required: false,
   })
+  @IsOptional()
   @IsEnum(OtpIntent)
-  intent: OtpIntent;
+  intent?: OtpIntent;
 
   @ApiProperty({
     description: 'Nigerian phone number',
     example: '08012345678',
   })
   @IsString()
-  @IsPhoneNumber('NG')
   phone: string;
 
   @ApiProperty({
     description: '6-digit OTP code',
-    example: '123456',
+    example: '482913',
   })
   @IsString()
   otp: string;
 
   @ApiProperty({
     description: 'First name (required for signup only)',
-    example: 'Oyindamola',
+    example: 'Ada',
     required: false,
   })
   @ValidateIf((o) => o.intent === OtpIntent.SIGNUP)
@@ -74,7 +112,7 @@ export class VerifyOtpDto {
 
   @ApiProperty({
     description: 'Last name (required for signup only)',
-    example: 'Ajala',
+    example: 'Obi',
     required: false,
   })
   @ValidateIf((o) => o.intent === OtpIntent.SIGNUP)
@@ -84,57 +122,45 @@ export class VerifyOtpDto {
 
   @ApiProperty({
     description:
-      'Unique handle, stored lowercase (required for signup). 3–24 characters: letters, numbers, underscore.',
-    example: 'oyin_ajala',
+      'Unique handle, stored lowercase (required for signup). 3–20 characters: a-z, 0-9, underscore, dot.',
+    example: 'ada_o',
     required: false,
   })
   @ValidateIf((o) => o.intent === OtpIntent.SIGNUP)
   @IsNotEmpty({ message: 'username is required for signup' })
   @IsString()
-  @Matches(/^[a-zA-Z0-9_]{3,24}$/, {
-    message: 'username must be 3–24 characters (letters, numbers, underscore)',
-  })
   username?: string;
 
   @ApiProperty({
     description:
-      '11-digit BVN (required for signup). Squad sandbox docs often use test BVN 22110011001; names, DOB, and phone must match what Squad expects for that BVN.',
-    example: '22110011001',
-    required: false,
-  })
-  @ValidateIf((o) => o.intent === OtpIntent.SIGNUP)
-  @IsNotEmpty({ message: 'bvn is required for signup' })
-  @Matches(/^\d{11}$/, { message: 'bvn must be 11 digits' })
-  bvn?: string;
-
-  @ApiProperty({
-    description:
-      'Date of birth (required for signup). Use mm/dd/yyyy, dd/mm/yyyy, or yyyy-mm-dd — normalized for Squad. Must match BVN on Squad side.',
-    example: '10/30/1990',
-    required: false,
-  })
-  @ValidateIf((o) => o.intent === OtpIntent.SIGNUP)
-  @IsNotEmpty({ message: 'dob is required for signup' })
-  @IsString()
-  dob?: string;
-
-  @ApiProperty({
-    description: 'Email address (optional; used on signup when provided)',
-    example: 'oyindamola@example.com',
+      'Email address (optional; validated server-side and unique when present)',
+    example: 'ada@example.com',
     required: false,
   })
   @IsOptional()
-  @IsEmail()
+  @IsString()
+  @Transform(lower)
   email?: string;
 
   @ApiProperty({
-    description: 'Avatar URL (optional on signup; if omitted, a default image is generated)',
+    description: 'Avatar URL (optional on signup; a default image is generated when omitted)',
     example: 'https://example.com/avatar.jpg',
     required: false,
   })
   @IsOptional()
   @IsUrl()
   avatar_url?: string;
+
+  // KYC is no longer collected at signup. Accepted for older app builds and ignored.
+  @ApiProperty({ description: 'Deprecated: ignored at signup', required: false })
+  @IsOptional()
+  @IsString()
+  bvn?: string;
+
+  @ApiProperty({ description: 'Deprecated: ignored at signup', required: false })
+  @IsOptional()
+  @IsString()
+  dob?: string;
 }
 
 export class TestLoginDto {
@@ -150,13 +176,27 @@ export class TestLoginDto {
   account?: string;
 }
 
+/**
+ * Refresh/logout accept both spellings while older builds migrate:
+ * the app sends refreshToken; refresh_token stays supported.
+ */
 export class RefreshTokenDto {
   @ApiProperty({
     description: 'Refresh token from previous login',
-    example: 'uuid-string',
+    example: 'rt_...',
+    required: false,
   })
+  @IsOptional()
   @IsString()
-  refresh_token: string;
+  refreshToken?: string;
+
+  @ApiProperty({
+    description: 'Alias for refreshToken (legacy builds)',
+    required: false,
+  })
+  @IsOptional()
+  @IsString()
+  refresh_token?: string;
 }
 
 export class WalletDataDto {
@@ -168,41 +208,59 @@ export class WalletDataDto {
 }
 
 export class UserDataDto {
-  @ApiProperty({ description: 'User ID', example: 'uuid' })
+  @ApiProperty({ description: 'User ID', example: 'usr_01J...' })
   id: string;
 
-  @ApiProperty({ description: 'Phone number', example: '08012345678' })
+  @ApiProperty({ description: 'Phone number in E.164', example: '+2348123456789' })
   phone: string;
 
   @ApiProperty({
     description: 'Public username (null for legacy accounts)',
-    example: 'oyin_ajala',
+    example: 'ada_o',
     nullable: true,
   })
   username: string | null;
 
-  @ApiProperty({ description: 'First name', example: 'Oyindamola' })
+  @ApiProperty({ description: 'First name', example: 'Ada' })
   first_name: string;
 
-  @ApiProperty({ description: 'Last name', example: 'Ajala' })
+  @ApiProperty({ description: 'Last name', example: 'Obi' })
   last_name: string;
 
   @ApiProperty({
     description: 'Email address',
-    example: 'oyindamola@example.com',
+    example: 'ada@example.com',
     nullable: true,
   })
   email: string | null;
 
   @ApiProperty({
     description: 'Resolved avatar URL (custom or generated)',
-    example: 'https://api.dicebear.com/7.x/initials/svg?seed=oyin_ajala',
+    example: 'https://api.dicebear.com/7.x/initials/svg?seed=ada_o',
     nullable: true,
   })
   avatar_url: string | null;
 
   @ApiProperty({
-    description: 'Squad virtual account number',
+    description: 'KYC state: NOT_STARTED | PENDING | VERIFIED | REJECTED',
+    example: 'NOT_STARTED',
+  })
+  kyc_status: string;
+
+  @ApiProperty({ description: 'KYC verified badge', example: false })
+  kyc_verified: boolean;
+
+  @ApiProperty({ description: 'Account tier: 0 phone-verified, 1 KYC-verified', example: 0 })
+  tier: number;
+
+  @ApiProperty({ description: 'Server-owned trust score 0-100', example: 62 })
+  trust_score: number;
+
+  @ApiProperty({ description: 'LOW | MEDIUM | TRUSTED', example: 'MEDIUM' })
+  trust_tier: string;
+
+  @ApiProperty({
+    description: 'Squad virtual account number (null until KYC is verified)',
     example: '0123456789',
     nullable: true,
   })
@@ -214,12 +272,6 @@ export class UserDataDto {
     nullable: true,
   })
   squad_bank_code: string | null;
-
-  @ApiProperty({
-    description: 'KYC verification status',
-    example: false,
-  })
-  kyc_verified: boolean;
 }
 
 export class VerifyOtpResponseDto {
@@ -227,13 +279,19 @@ export class VerifyOtpResponseDto {
     description: 'JWT access token (15 min TTL)',
     example: 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...',
   })
-  access_token: string;
+  accessToken: string;
 
   @ApiProperty({
-    description: 'Refresh token (7 day TTL in Redis)',
-    example: 'uuid-string',
+    description: 'Rotating refresh token (30 day TTL)',
+    example: 'rt_...',
   })
-  refresh_token: string;
+  refreshToken: string;
+
+  @ApiProperty({
+    description: 'Access token lifetime in seconds',
+    example: 900,
+  })
+  expiresIn: number;
 
   @ApiProperty({
     description: 'Authenticated user data',
@@ -253,45 +311,51 @@ export class RefreshTokenResponseDto {
     description: 'New JWT access token',
     example: 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...',
   })
-  access_token: string;
+  accessToken: string;
 
   @ApiProperty({
-    description: 'New refresh token',
-    example: 'uuid-string',
+    description: 'New refresh token (the old one is revoked)',
+    example: 'rt_...',
   })
-  refresh_token: string;
+  refreshToken: string;
+
+  @ApiProperty({ description: 'Access token lifetime in seconds', example: 900 })
+  expiresIn: number;
 }
 
 export class OtpResponseDto {
-  @ApiProperty({
-    description: 'Success status',
-    example: true,
-  })
+  @ApiProperty({ description: 'Success status', example: true })
   success: boolean;
 
-  @ApiProperty({
-    description: 'Response message',
-    example: 'OTP sent successfully',
-  })
+  @ApiProperty({ description: 'Response message', example: 'OTP sent successfully' })
   message: string;
 
-  @ApiProperty({
-    description: 'OTP expiry in seconds',
-    example: 600,
-  })
+  @ApiProperty({ description: 'OTP expiry in seconds', example: 300 })
   expires_in: number;
+
+  @ApiProperty({ description: 'Seconds before another code may be requested', example: 60 })
+  resend_after: number;
 }
 
-export class LogoutResponseDto {
+export class AvailabilityFieldDto {
   @ApiProperty({
-    description: 'Success status',
-    example: true,
+    description: 'available | taken | invalid',
+    example: 'available',
+    enum: ['available', 'taken', 'invalid'],
   })
-  success: boolean;
+  phone?: string;
 
   @ApiProperty({
-    description: 'Response message',
-    example: 'Logged out successfully',
+    description: 'available | taken | invalid',
+    example: 'taken',
+    enum: ['available', 'taken', 'invalid'],
   })
-  message: string;
+  email?: string;
+
+  @ApiProperty({
+    description: 'available | taken | invalid',
+    example: 'available',
+    enum: ['available', 'taken', 'invalid'],
+  })
+  username?: string;
 }

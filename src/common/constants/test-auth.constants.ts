@@ -1,3 +1,5 @@
+import { normalizeNgPhone } from '../utils/phone.util';
+
 /**
  * Test-only authentication helpers.
  *
@@ -19,6 +21,7 @@ export interface TestAccount {
   last_name: string;
   email: string;
 }
+
 
 export const TEST_AUTH_OTP = process.env.TEST_AUTH_OTP?.trim() || '123456';
 
@@ -53,7 +56,17 @@ export function isTestAuthEnabled(): boolean {
   const flag = (process.env.AUTH_TEST_MODE ?? '').trim().toLowerCase();
   if (flag === 'true' || flag === '1' || flag === 'yes') return true;
   if (flag === 'false' || flag === '0' || flag === 'no') return false;
-  return process.env.NODE_ENV !== 'production';
+
+  // No explicit flag: only allow in a clearly non-production environment.
+  // Fails closed when NODE_ENV is missing so a misconfigured deploy cannot
+  // expose passwordless test logins.
+  const env = (process.env.NODE_ENV ?? '').trim().toLowerCase();
+  return (
+    env === 'development' ||
+    env === 'dev' ||
+    env === 'local' ||
+    env === 'test'
+  );
 }
 
 /** Resolve a test account by slot ("1".."3"), phone, or username. Defaults to slot 1. */
@@ -61,10 +74,16 @@ export function resolveTestAccount(account?: string): TestAccount | undefined {
   const key = (account ?? '').trim().toLowerCase();
   if (!key || key === '1' || key === 'default') return TEST_ACCOUNTS[0];
 
+  // Accept either the preset local format (08000001) or the normalized
+  // E.164-style digits (234800000001) that the API stores.
+  const keyPhone = key.replace(/\D/g, '');
+
   return TEST_ACCOUNTS.find(
     (candidate) =>
       String(candidate.index) === key ||
       candidate.phone === key ||
+      (keyPhone !== '' &&
+        normalizeNgPhone(candidate.phone) === normalizeNgPhone(keyPhone)) ||
       candidate.username.toLowerCase() === key,
   );
 }

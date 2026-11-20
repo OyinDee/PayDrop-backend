@@ -1,16 +1,22 @@
-import { Controller, Post, Get, Body, UseGuards } from '@nestjs/common';
+import {
+  Controller,
+  Post,
+  Get,
+  Body,
+  Headers,
+  HttpCode,
+} from '@nestjs/common';
 import {
   ApiTags,
   ApiOperation,
   ApiResponse,
   ApiBody,
-  ApiBearerAuth,
   ApiHeader,
 } from '@nestjs/swagger';
 import { AuthService } from './auth.service';
-import { CurrentUser } from '../common/decorators/current-user.decorator';
-import { JwtAuthGuard } from '../common/guards/jwt-auth.guard';
 import {
+  AvailabilityFieldDto,
+  CheckAvailabilityDto,
   RequestOtpDto,
   TestLoginDto,
   VerifyOtpDto,
@@ -18,116 +24,118 @@ import {
   OtpResponseDto,
   VerifyOtpResponseDto,
   RefreshTokenResponseDto,
-  LogoutResponseDto,
 } from './dto/auth.dto';
 
 @ApiTags('Auth')
+@ApiHeader({
+  name: 'x-device-id',
+  required: false,
+  description: 'Stable per-install identifier. Binds refresh tokens to a device.',
+})
 @Controller('auth')
 export class AuthController {
   constructor(private authService: AuthService) {}
 
+  @Post('check-availability')
+  @HttpCode(200)
+  @ApiOperation({
+    summary: 'Check phone / email / username availability',
+    description:
+      'Pre-check identifiers before sending an OTP. Each field answers available, taken or invalid. Sends nothing and reveals nothing else.',
+  })
+  @ApiBody({ type: CheckAvailabilityDto })
+  @ApiResponse({ status: 200, type: AvailabilityFieldDto })
+  async checkAvailability(@Body() body: CheckAvailabilityDto) {
+    return this.authService.checkAvailability(body);
+  }
+
   @Post('request-otp')
+  @HttpCode(200)
   @ApiOperation({
     summary: 'Request OTP',
-    description: 'Send OTP to phone via Termii SMS. Rate limited: 3 per 10 minutes.',
+    description:
+      'Send a 6-digit code by SMS for login or signup. Codes live 5 minutes; resend cooldown 60s; max 5 per phone per hour.',
   })
   @ApiBody({ type: RequestOtpDto })
-  @ApiResponse({
-    status: 200,
-    description: 'OTP sent successfully',
-    type: OtpResponseDto,
-  })
-  @ApiResponse({ status: 400, description: 'Invalid phone or rate limited' })
-  @ApiResponse({ status: 429, description: 'Too many requests' })
-  async requestOtp(@Body() body: RequestOtpDto): Promise<OtpResponseDto> {
-    return await this.authService.requestOtp(body.phone, body.intent);
+  @ApiResponse({ status: 200, type: OtpResponseDto })
+  @ApiResponse({ status: 404, description: 'ACCOUNT_NOT_FOUND (login, unknown phone)' })
+  @ApiResponse({ status: 409, description: 'ACCOUNT_EXISTS (signup, known phone)' })
+  @ApiResponse({ status: 429, description: 'RATE_LIMITED' })
+  async requestOtp(@Body() body: RequestOtpDto) {
+    return this.authService.requestOtp(body.phone, body.intent);
   }
 
   @Post('verify-otp')
+  @HttpCode(200)
   @ApiOperation({
     summary: 'Verify OTP — login or signup',
     description:
-      'Requires intent matching request-otp. login: existing users only. signup: creates user + Squad VA (BVN validated by Squad) + wallet; requires first_name, last_name, bvn, dob.',
+      'Requires intent matching request-otp. login: existing users only. signup: creates the user + wallet in one transaction with phone, name, username and optional email. No BVN or date of birth is collected.',
   })
   @ApiBody({ type: VerifyOtpDto })
-  @ApiResponse({
-    status: 200,
-    description: 'OTP verified, tokens issued',
-    type: VerifyOtpResponseDto,
-  })
-  @ApiResponse({ status: 400, description: 'Invalid OTP or missing required fields' })
-  @ApiResponse({ status: 401, description: 'OTP verification failed' })
-  async verifyOtp(@Body() body: VerifyOtpDto): Promise<VerifyOtpResponseDto> {
-    return await this.authService.verifyOtp(body);
+  @ApiResponse({ status: 200, type: VerifyOtpResponseDto })
+  @ApiResponse({ status: 401, description: 'OTP_INVALID' })
+  @ApiResponse({ status: 410, description: 'OTP_EXPIRED' })
+  @ApiResponse({ status: 409, description: 'USERNAME_TAKEN / EMAIL_TAKEN / ACCOUNT_EXISTS' })
+  async verifyOtp(
+    @Body() body: VerifyOtpDto,
+    @Headers('x-device-id') deviceId?: string,
+  ) {
+    return this.authService.verifyOtp(body, deviceId);
   }
 
   @Post('test-login')
+  @HttpCode(200)
   @ApiOperation({
     summary: 'TEST ONLY - log in as a preset account (no SMS)',
     description:
-      'Disabled unless AUTH_TEST_MODE is enabled. Signs in as one of 3 preset test accounts and creates the user + wallet on first use. No OTP, no BVN, no Squad virtual account.',
+      'Disabled unless AUTH_TEST_MODE is enabled. Signs in as one of 3 preset test accounts and creates the user + wallet on first use.',
   })
   @ApiBody({ type: TestLoginDto })
-  @ApiResponse({
-    status: 200,
-    description: 'Tokens issued',
-    type: VerifyOtpResponseDto,
-  })
+  @ApiResponse({ status: 200, type: VerifyOtpResponseDto })
   @ApiResponse({ status: 404, description: 'Test auth is disabled' })
-  async testLogin(@Body() body: TestLoginDto): Promise<VerifyOtpResponseDto> {
-    return await this.authService.testLogin(body?.account);
+  async testLogin(
+    @Body() body: TestLoginDto,
+    @Headers('x-device-id') deviceId?: string,
+  ) {
+    return this.authService.testLogin(body?.account, deviceId);
   }
 
   @Get('test-accounts')
   @ApiOperation({
-    summary: 'TEST ONLY - list preset test accounts and the fixed OTP',
-    description: 'Disabled unless AUTH_TEST_MODE is enabled.',
+    summary: 'TEST ONLY - list preset accounts and the fixed OTP',
   })
-  async testAccounts(): Promise<any> {
+  @ApiResponse({ status: 404, description: 'Test auth is disabled' })
+  async testAccounts() {
     return this.authService.listTestAccounts();
   }
 
   @Post('refresh')
+  @HttpCode(200)
   @ApiOperation({
-    summary: 'Refresh Access Token',
+    summary: 'Rotate the token pair',
     description:
-      'Exchange refresh token for new access token. Old token invalidated immediately.',
+      'Accepted body: { refreshToken }. Rotating revokes the old token; replaying a rotated token revokes the whole session family.',
   })
   @ApiBody({ type: RefreshTokenDto })
-  @ApiResponse({
-    status: 200,
-    description: 'New tokens issued',
-    type: RefreshTokenResponseDto,
-  })
-  @ApiResponse({ status: 401, description: 'Invalid or expired refresh token' })
-  async refresh(@Body() body: RefreshTokenDto): Promise<RefreshTokenResponseDto> {
-    return await this.authService.refreshAccessToken(body);
+  @ApiResponse({ status: 200, type: RefreshTokenResponseDto })
+  @ApiResponse({ status: 401, description: 'REFRESH_INVALID' })
+  async refresh(
+    @Body() body: RefreshTokenDto,
+    @Headers('x-device-id') deviceId?: string,
+  ) {
+    return this.authService.refreshAccessToken(body, deviceId);
   }
 
   @Post('logout')
-  @UseGuards(JwtAuthGuard)
-  @ApiBearerAuth()
-  @ApiHeader({
-    name: 'x-device-id',
-    required: true,
-    description: 'Device identifier required for authenticated requests',
-  })
+  @HttpCode(204)
   @ApiOperation({
-    summary: 'Logout',
-    description: 'Delete refresh token from Redis. Access token expires naturally.',
+    summary: 'Revoke the session server-side',
+    description:
+      'Sends { refreshToken } and revokes it. Idempotent: always 204, even when the token is unknown.',
   })
-  @ApiBody({ type: RefreshTokenDto })
-  @ApiResponse({
-    status: 200,
-    description: 'Logged out successfully',
-    type: LogoutResponseDto,
-  })
-  @ApiResponse({ status: 401, description: 'Unauthorized' })
-  async logout(
-    @Body() body: RefreshTokenDto,
-    @CurrentUser() user: any,
-  ): Promise<LogoutResponseDto> {
-    return await this.authService.logout(body.refresh_token);
+  @ApiResponse({ status: 204, description: 'Session revoked' })
+  async logout(@Body() body: RefreshTokenDto) {
+    await this.authService.logout(body?.refreshToken ?? body?.refresh_token);
   }
 }
-

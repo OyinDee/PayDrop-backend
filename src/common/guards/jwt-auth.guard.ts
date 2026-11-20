@@ -17,22 +17,34 @@ export class JwtAuthGuard implements CanActivate {
   async canActivate(context: ExecutionContext): Promise<boolean> {
     const request = context.switchToHttp().getRequest();
     const token = this.extractToken(request);
-    const deviceId = request.headers['x-device-id'];
+    const headerDeviceId = request.headers['x-device-id'];
+    const deviceId =
+      typeof headerDeviceId === 'string' && headerDeviceId.trim().length > 0
+        ? headerDeviceId.trim()
+        : null;
 
     if (!token) {
       throw new UnauthorizedException('Missing authorization token');
     }
-    if (!deviceId || String(deviceId).trim().length === 0) {
-      throw new UnauthorizedException('Missing x-device-id header');
-    }
 
     try {
       const secret = this.configService.get<string>('JWT_ACCESS_SECRET');
-      const payload = this.jwtService.verify(token, { secret });
+      const payload: any = this.jwtService.verify(token, { secret });
+
+      // A token bound to a device stays bound to it: presenting the header
+      // with a different value is rejected. The header is otherwise optional so
+      // a plain Bearer token is enough (no x-device-id requirement).
+      if (deviceId && payload.did && String(payload.did) !== deviceId) {
+        throw new UnauthorizedException(
+          'Token was issued for a different device',
+        );
+      }
+
       request.user = payload;
-      request.device_id = String(deviceId);
+      request.device_id = deviceId ?? payload.did ?? null;
       return true;
     } catch (error) {
+      if (error instanceof UnauthorizedException) throw error;
       throw new UnauthorizedException('Invalid or expired token');
     }
   }

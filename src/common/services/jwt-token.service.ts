@@ -1,10 +1,11 @@
-import { Injectable } from '@nestjs/common';
+﻿import { Injectable } from '@nestjs/common';
 import { JwtService as NestJwtService } from '@nestjs/jwt';
 import { ConfigService } from '@nestjs/config';
 
 export interface JwtPayload {
   sub: string; // userId
   phone: string;
+  did?: string; // device id the token was issued for
   iat?: number;
   exp?: number;
 }
@@ -19,11 +20,12 @@ export class JwtTokenService {
   /**
    * Generate JWT access token
    */
-  generateAccessToken(userId: string, phone: string): string {
+  generateAccessToken(userId: string, phone: string, deviceId?: string): string {
     const expiresIn = this.configService.get<string>('JWT_ACCESS_EXPIRY', '15m');
-    // cast payload to any to avoid mismatched overload typings from jwt lib types
-    // cast options to any to avoid strict overload mismatch with underlying jwt lib types
-    return this.jwtService.sign({ sub: userId, phone } as any, {
+    const payload = deviceId
+      ? { sub: userId, phone, did: deviceId }
+      : { sub: userId, phone };
+    return this.jwtService.sign(payload as any, {
       secret: this.configService.get<string>('JWT_ACCESS_SECRET') as string,
       expiresIn,
     } as any);
@@ -34,8 +36,6 @@ export class JwtTokenService {
    */
   generateRefreshToken(userId: string, phone: string): string {
     const expiresIn = this.configService.get<string>('JWT_REFRESH_EXPIRY', '7d');
-    // cast payload to any to avoid mismatched overload typings from jwt lib types
-    // cast options to any to avoid strict overload mismatch with underlying jwt lib types
     return this.jwtService.sign({ sub: userId, phone } as any, {
       secret: this.configService.get<string>('JWT_REFRESH_SECRET') as string,
       expiresIn,

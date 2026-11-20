@@ -1,154 +1,421 @@
 import {
   Injectable,
-  UnauthorizedException,
-  BadRequestException,
-  ConflictException,
-  NotFoundException,
+  HttpStatus,
 } from '@nestjs/common';
 import { v4 as uuidv4 } from 'uuid';
 import { PrismaService } from '../common/prisma/prisma.service';
 import { TermiiService } from '../common/services/termii.service';
 import { JwtTokenService } from '../common/services/jwt-token.service';
 import { RedisService } from '../common/services/redis.service';
-import { SquadService } from '../common/services/squad.service';
 import { ActivityLogService } from '../common/services/activity-log.service';
+import { TrustService } from '../common/services/trust.service';
 import { VerifyOtpDto, RefreshTokenDto, OtpIntent } from './dto/auth.dto';
-import { normalizeNgPhone } from '../common/utils/phone.util';
-import { buildDefaultAvatarUrl, resolveUserAvatarUrl } from '../common/utils/avatar.util';
+import {
+  normalizeNgPhone,
+  toE164,
+  isValidNgPhone,
+} from '../common/utils/phone.util';
+import {
+  buildDefaultAvatarUrl,
+  resolveUserAvatarUrl,
+} from '../common/utils/avatar.util';
 import {
   isTestAuthEnabled,
   resolveTestAccount,
   TEST_ACCOUNTS,
   TEST_AUTH_OTP,
 } from '../common/constants/test-auth.constants';
-// Use enum values as strings to avoid relying on generated prisma client exports
+import { apiError } from '../common/errors/api-error';
+import { enforceRateLimit } from '../common/utils/rate-limit.util';
+
+const USERNAME_RE = /^[a-z0-9_.]{3,20}$/;
+const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/;
+const NAME_RE = /^[A-Za-z][A-Za-z\s'-]{0,49}$/;
+
+/** Handles we never hand out to users. */
+const RESERVED_USERNAMES = new Set([
+  'admin',
+  'administrator',
+  'paydrop',
+  'support',
+  'help',
+  'api',
+  'root',
+  'system',
+  'official',
+  'security',
+  'billing',
+  'wallet',
+  'settings',
+  'me',
+  'users',
+  'auth',
+]);
 
 @Injectable()
 export class AuthService {
-  private readonly OTP_RATE_LIMIT = 3; // max requests per 10 minutes
-  private readonly OTP_RATE_WINDOW = 600; // 10 minutes in seconds
-  private readonly REFRESH_TOKEN_TTL = 604800; // 7 days in seconds
+  /** 5 OTP requests per phone per hour (requirements 3.5). */
+  private readonly OTP_HOURLY_LIMIT = 5;
+  private readonly OTP_RATE_WINDOW = 3600;
+  /** 60 s server-enforced resend cooldown. */
+  private readonly OTP_RESEND_COOLDOWN = 60;
+  private readonly OTP_MAX_ATTEMPTS = 5;
+  /** Rotating refresh token: 30 days (requirements 3.4). */
+  private readonly REFRESH_TOKEN_TTL = 2592000;
 
   constructor(
     private readonly prisma: PrismaService,
     private readonly termiiService: TermiiService,
     private readonly jwtService: JwtTokenService,
     private readonly redisService: RedisService,
-    private readonly squadService: SquadService,
     private readonly activityLog: ActivityLogService,
+    private readonly trustService: TrustService,
   ) {}
 
+  /** Access token lifetime in seconds, derived from JWT_ACCESS_EXPIRY. */
+  private get accessTokenTtlSeconds(): number {
+    const raw = process.env.JWT_ACCESS_EXPIRY || '15m';
+    const match = /^(\d+)([smhd])?$/.exec(raw.trim());
+    if (!match) return 900;
+    const value = Number(match[1]);
+    const unit = match[2] || 's';
+    const multiplier = unit === 'm' ? 60 : unit === 'h' ? 3600 : unit === 'd' ? 86400 : 1;
+    return value * multiplier;
+  }
+
+  // ── availability ─────────────────────────────────────────────
+
   /**
-   * Request OTP via Termii
-   * Rate limited: 3 requests per phone per 10 minutes
+   * POST /auth/check-availability — fail the Register form before an OTP is
+   * burned. Never reveals more than available | taken | invalid.
    */
-  async requestOtp(phone: string, intent: OtpIntent): Promise<any> {
+  async checkAvailability(input: {
+    phone?: string;
+    email?: string;
+    username?: string;
+  }) {
+    if (!input.phone && !input.email && !input.username) {
+      throw apiError(
+        HttpStatus.BAD_REQUEST,
+        'VALIDATION_ERROR',
+        'Provide at least one of phone, email or username.',
+        { field: 'phone' },
+      );
+    }
+
+    const result: { phone?: string; email?: string; username?: string } = {};
+
+    if (input.phone !== undefined) {
+      result.phone = !isValidNgPhone(input.phone)
+        ? 'invalid'
+        : (await this.prisma.user.findUnique({
+            where: { phone: normalizeNgPhone(input.phone) },
+            select: { id: true },
+          }))
+          ? 'taken'
+          : 'available';
+    }
+
+    if (input.email !== undefined) {
+      const email = input.email.trim().toLowerCase();
+      result.email = !EMAIL_RE.test(email)
+        ? 'invalid'
+        : (await this.prisma.user.findUnique({
+            where: { email },
+            select: { id: true },
+          }))
+          ? 'taken'
+          : 'available';
+    }
+
+    if (input.username !== undefined) {
+      const username = input.username.trim().toLowerCase();
+      result.username =
+        !USERNAME_RE.test(username) || RESERVED_USERNAMES.has(username)
+          ? 'invalid'
+          : (await this.prisma.user.findUnique({
+              where: { username },
+              select: { id: true },
+            }))
+            ? 'taken'
+            : 'available';
+    }
+
+    return result;
+  }
+
+  // ── OTP ──────────────────────────────────────────────────────
+
+  async requestOtp(phone: string, intent?: OtpIntent) {
+    if (!isValidNgPhone(phone)) {
+      throw apiError(
+        HttpStatus.BAD_REQUEST,
+        'VALIDATION_ERROR',
+        'Enter a valid Nigerian mobile number.',
+        { field: 'phone' },
+      );
+    }
+
     const normalizedPhone = normalizeNgPhone(phone);
 
-    const existingUser = await (this.prisma as any).user.findUnique({
+    const existingUser = await this.prisma.user.findUnique({
       where: { phone: normalizedPhone },
       select: { id: true },
     });
 
-    if (intent === OtpIntent.LOGIN && !existingUser) {
-      throw new BadRequestException(
-        'No account for this phone number. Use signup to register.',
+    // Intent is optional: a client that just posts a number gets the flow that
+    // matches the account (existing -> login, new -> signup).
+    const resolvedIntent: OtpIntent =
+      intent ?? (existingUser ? OtpIntent.LOGIN : OtpIntent.SIGNUP);
+
+    if (resolvedIntent === OtpIntent.LOGIN && !existingUser) {
+      throw apiError(
+        HttpStatus.NOT_FOUND,
+        'ACCOUNT_NOT_FOUND',
+        'No PayDrop account uses this number. Create one instead.',
+        { phone: toE164(normalizedPhone) },
       );
     }
 
-    if (intent === OtpIntent.SIGNUP && existingUser) {
-      throw new BadRequestException(
-        'This phone is already registered. Use login to sign in.',
+    if (resolvedIntent === OtpIntent.SIGNUP && existingUser) {
+      throw apiError(
+        HttpStatus.CONFLICT,
+        'ACCOUNT_EXISTS',
+        'This number already has an account. Log in instead.',
+        { phone: toE164(normalizedPhone) },
       );
     }
 
-    // Rate limit check
-    const rateLimitKey = `otp_rate:${normalizedPhone}`;
-    const attempts = await this.redisService.get<number>(rateLimitKey);
-
-    if (!isTestAuthEnabled() && attempts && attempts >= this.OTP_RATE_LIMIT) {
-      throw new BadRequestException(
-        'Too many OTP requests. Try again in 10 minutes.',
+    // Server-enforced resend cooldown.
+    const cooldownKey = `otp_cooldown:${normalizedPhone}`;
+    const cooldown = await this.redisService.ttl(cooldownKey);
+    if (!isTestAuthEnabled() && cooldown > 0) {
+      throw apiError(
+        HttpStatus.TOO_MANY_REQUESTS,
+        'RATE_LIMITED',
+        `Wait ${cooldown}s before requesting another code.`,
+        { retry_after: cooldown },
       );
+    }
+
+    if (!isTestAuthEnabled()) {
+      await enforceRateLimit(this.redisService, {
+        key: `otp_rate:${normalizedPhone}`,
+        limit: this.OTP_HOURLY_LIMIT,
+        windowSeconds: this.OTP_RATE_WINDOW,
+        message: 'Too many codes requested for this number. Try again later.',
+      });
     }
 
     try {
-      // Send OTP via Termii
-      await this.termiiService.sendOtp(normalizedPhone);
-
-      // Increment rate limit counter
-      if (attempts) {
-        await this.redisService.set(
-          rateLimitKey,
-          attempts + 1,
-          this.OTP_RATE_WINDOW,
-        );
-      } else {
-        await this.redisService.set(
-          rateLimitKey,
-          1,
-          this.OTP_RATE_WINDOW,
-        );
-      }
-
-      return {
-        success: true,
-        message: 'OTP sent successfully',
-        expires_in: 600, // 10 minutes
-      };
+      await this.termiiService.sendOtp(normalizedPhone, resolvedIntent);
     } catch (error) {
       const message = error instanceof Error ? error.message : 'Unknown error';
-      throw new BadRequestException('Failed to send OTP: ' + message);
+      throw apiError(
+        HttpStatus.BAD_GATEWAY,
+        'SERVICE_UNAVAILABLE',
+        'Could not send the code right now. Please try again.',
+        { provider_message: message },
+      );
     }
-  }
 
-  /**
-   * Verify OTP and create/update user
-   * On first login: atomic transaction creates user + Squad VA + wallet
-   */
-  async verifyOtp(data: VerifyOtpDto): Promise<any> {
-    const {
-      intent,
-      phone,
-      otp,
-      first_name,
-      last_name,
-      email,
-      avatar_url,
-      username,
-      bvn,
-      dob,
-    } = data;
-    const normalizedPhone = normalizeNgPhone(phone);
-
-    // Verify OTP with Termii
-    const otpVerification = await this.termiiService.verifyOtp(
-      normalizedPhone,
-      otp,
+    await this.redisService.set(
+      cooldownKey,
+      1,
+      this.OTP_RESEND_COOLDOWN,
     );
 
-    if (!otpVerification.verified) {
-      const userForLog = await (this.prisma as any).user.findUnique({
-        where: { phone: normalizedPhone },
-        select: { id: true },
-      });
+    return {
+      success: true,
+      message: 'OTP sent successfully',
+      intent: resolvedIntent,
+      expires_in: this.termiiService.ttlSeconds,
+      resend_after: this.OTP_RESEND_COOLDOWN,
+    };
+  }
 
-      await this.activityLog.log(userForLog?.id, 'OTP_FAILED', {
-        reason: 'Invalid OTP',
-      });
-      throw new UnauthorizedException('Invalid OTP');
+  // ── verify / signup ──────────────────────────────────────────
+
+  async verifyOtp(data: VerifyOtpDto, deviceId?: string) {
+    const { phone, otp, first_name, last_name, email, avatar_url } = data;
+
+    if (!isValidNgPhone(phone)) {
+      throw apiError(
+        HttpStatus.BAD_REQUEST,
+        'VALIDATION_ERROR',
+        'Enter a valid Nigerian mobile number.',
+        { field: 'phone' },
+      );
     }
 
-    // Check if user exists
-    const existingUser = await (this.prisma as any).user.findUnique({
+    const normalizedPhone = normalizeNgPhone(phone);
+
+    // The intent is optional here too: default to the flow that fits the
+    // account so a client can verify with just { phone, otp }.
+    const phoneOwner = await this.prisma.user.findUnique({
       where: { phone: normalizedPhone },
       include: { wallet: true },
     });
+    const intent: OtpIntent =
+      data.intent ?? (phoneOwner ? OtpIntent.LOGIN : OtpIntent.SIGNUP);
+
+    const attemptKey = `otp_attempts:${intent}:${normalizedPhone}`;
+
+    // Brute-force guard. Skipped in test mode so local flows stay usable.
+    if (!isTestAuthEnabled()) {
+      const failedAttempts = Number(
+        (await this.redisService.get<number>(attemptKey)) ?? 0,
+      );
+      if (failedAttempts >= this.OTP_MAX_ATTEMPTS) {
+        throw apiError(
+          HttpStatus.TOO_MANY_REQUESTS,
+          'OTP_ATTEMPTS_EXCEEDED',
+          'Too many invalid attempts on this code. Request a new one.',
+          { attempts_left: 0 },
+        );
+      }
+    }
+
+    // Signup-only validation happens BEFORE the code is consumed, so a taken
+    // username or email does not burn the OTP (requirements 3.3).
+    let normalizedUsername: string | null = null;
+    let normalizedEmail: string | null = null;
+
+    if (intent === OtpIntent.SIGNUP) {
+      const firstName = (first_name ?? '').trim();
+      const lastName = (last_name ?? '').trim();
+      const missing = [
+        !firstName && 'first_name',
+        !lastName && 'last_name',
+        !(data.username ?? '').trim() && 'username',
+      ].filter(Boolean);
+
+      if (missing.length > 0) {
+        throw apiError(
+          HttpStatus.BAD_REQUEST,
+          'VALIDATION_ERROR',
+          `Missing required field(s) for signup: ${missing.join(', ')}.`,
+          { fields: missing },
+        );
+      }
+
+      if (!NAME_RE.test(firstName)) {
+        throw apiError(
+          HttpStatus.BAD_REQUEST,
+          'VALIDATION_ERROR',
+          'first_name must be 1-50 letters, spaces, hyphens or apostrophes.',
+          { field: 'first_name' },
+        );
+      }
+      if (!NAME_RE.test(lastName)) {
+        throw apiError(
+          HttpStatus.BAD_REQUEST,
+          'VALIDATION_ERROR',
+          'last_name must be 1-50 letters, spaces, hyphens or apostrophes.',
+          { field: 'last_name' },
+        );
+      }
+
+      normalizedUsername = (data.username ?? '').trim().toLowerCase();
+      if (
+        !USERNAME_RE.test(normalizedUsername) ||
+        RESERVED_USERNAMES.has(normalizedUsername)
+      ) {
+        throw apiError(
+          HttpStatus.BAD_REQUEST,
+          'VALIDATION_ERROR',
+          'username must be 3-20 characters: letters, numbers, underscore or dot.',
+          { field: 'username' },
+        );
+      }
+
+      if (email) {
+        normalizedEmail = email.trim().toLowerCase();
+        if (!EMAIL_RE.test(normalizedEmail)) {
+          throw apiError(
+            HttpStatus.BAD_REQUEST,
+            'VALIDATION_ERROR',
+            'Enter a valid email address.',
+            { field: 'email' },
+          );
+        }
+      }
+
+      const [usernameOwner, emailOwner] = await Promise.all([
+        this.prisma.user.findUnique({
+          where: { username: normalizedUsername },
+          select: { id: true },
+        }),
+        normalizedEmail
+          ? this.prisma.user.findUnique({
+              where: { email: normalizedEmail },
+              select: { id: true },
+            })
+          : Promise.resolve(null),
+      ]);
+
+      if (usernameOwner) {
+        throw apiError(
+          HttpStatus.CONFLICT,
+          'USERNAME_TAKEN',
+          'That username is already taken.',
+          { field: 'username' },
+        );
+      }
+      if (emailOwner) {
+        throw apiError(
+          HttpStatus.CONFLICT,
+          'EMAIL_TAKEN',
+          'That email is already registered.',
+          { field: 'email' },
+        );
+      }
+    }
+
+    const otpVerification = await this.termiiService.verifyOtp(
+      normalizedPhone,
+      otp,
+      intent,
+    );
+
+    if (!otpVerification.verified) {
+      if (otpVerification.expired) {
+        throw apiError(
+          HttpStatus.GONE,
+          'OTP_EXPIRED',
+          otpVerification.message,
+        );
+      }
+
+      const attempts = await this.redisService.incr(attemptKey);
+      await this.redisService.expire(attemptKey, 600);
+
+      const attemptsLeft = Math.max(0, this.OTP_MAX_ATTEMPTS - Number(attempts));
+
+      await this.activityLog.log(null, 'OTP_FAILED', {
+        reason: 'Invalid OTP',
+        intent,
+        attempt: Number(attempts),
+      });
+
+      throw apiError(
+        HttpStatus.UNAUTHORIZED,
+        'OTP_INVALID',
+        `That code is not correct. ${attemptsLeft} attempt${attemptsLeft === 1 ? '' : 's'} left.`,
+        { attempts_left: attemptsLeft },
+      );
+    }
+
+    await this.redisService.del(attemptKey);
+
+    const existingUser = phoneOwner;
 
     if (intent === OtpIntent.LOGIN) {
       if (!existingUser) {
-        throw new NotFoundException(
-          'No account for this phone number. Sign up first.',
+        throw apiError(
+          HttpStatus.NOT_FOUND,
+          'ACCOUNT_NOT_FOUND',
+          'No PayDrop account uses this number. Create one instead.',
         );
       }
 
@@ -163,217 +430,210 @@ export class AuthService {
         existingUser.avatar_url = defaultAvatar;
       }
 
-      const accessToken = this.jwtService.generateAccessToken(
+      const session = await this.issueSession(
         existingUser.id,
         existingUser.phone,
-      );
-      const refreshToken = uuidv4();
-      await this.redisService.set(
-        `refresh:${refreshToken}`,
-        existingUser.id,
-        this.REFRESH_TOKEN_TTL,
+        deviceId,
       );
 
       await this.activityLog.log(existingUser.id, 'LOGIN_SUCCESS');
 
       return {
-        access_token: accessToken,
-        refresh_token: refreshToken,
-        user: this.formatUserResponse(existingUser),
-        wallet: {
-          balance: existingUser.wallet?.balance || 0n,
-          currency: 'NGN',
-        },
+        ...session,
+        user: await this.buildUserDto(existingUser),
+        wallet: this.walletDto(existingUser.wallet),
       };
     }
 
     // SIGNUP
     if (existingUser) {
-      throw new ConflictException(
-        'This phone is already registered. Log in instead.',
+      throw apiError(
+        HttpStatus.CONFLICT,
+        'ACCOUNT_EXISTS',
+        'This number already has an account. Log in instead.',
       );
-    }
-
-    if (!first_name || !last_name || !bvn || !dob || !username) {
-      throw new BadRequestException(
-        'first_name, last_name, username, bvn, and dob are required for signup',
-      );
-    }
-
-    const normalizedUsername = username.trim().toLowerCase();
-    const usernameTaken = await this.prisma.user.findUnique({
-      where: { username: normalizedUsername },
-      select: { id: true },
-    });
-    if (usernameTaken) {
-      throw new ConflictException('Username is already taken');
     }
 
     const storedAvatarUrl =
-      avatar_url?.trim() || buildDefaultAvatarUrl(normalizedUsername);
+      avatar_url?.trim() || buildDefaultAvatarUrl(normalizedUsername ?? '');
 
-    // First-time registration — atomic transaction
     try {
-      const user = await (this.prisma as any).$transaction(async (tx: any) => {
-        // 1. Create user
+      const user = await this.prisma.$transaction<any>(async (tx: any) => {
         const newUser = await tx.user.create({
           data: {
             phone: normalizedPhone,
             username: normalizedUsername,
-            first_name,
-            last_name,
-            email: email || null,
+            first_name: first_name!.trim(),
+            last_name: last_name!.trim(),
+            email: normalizedEmail,
             avatar_url: storedAvatarUrl,
+            kyc_verified: false,
+            kyc_status: 'NOT_STARTED',
+            kyc_tier: 0,
           },
         });
 
-        // 2. Create Squad VA (Squad validates BVN vs name, DOB, phone — no separate BVN-only API in docs)
-        const squadAccount = await this.squadService.createVirtualAccount(
-          newUser.id,
-          first_name,
-          last_name,
-          normalizedPhone,
-          email,
-          { bvn, dob },
-        );
-
-        // 3. Update user with Squad details
-        const updatedUser = await tx.user.update({
-          where: { id: newUser.id },
-          data: {
-            squad_virtual_account: squadAccount.virtual_account_number,
-            squad_bank_code: squadAccount.bank_code,
-            kyc_verified: true,
-          },
-          include: { wallet: true },
-        });
-
-        // 4. Create wallet
+        // The wallet exists from the first second of the account; the Squad
+        // virtual account is provisioned later, when KYC is completed.
         const wallet = await tx.wallet.create({
           data: {
-            user_id: updatedUser.id,
+            user_id: newUser.id,
             balance: 0n,
             currency: 'NGN',
           },
         });
 
-        updatedUser.wallet = wallet;
-        return updatedUser;
+        newUser.wallet = wallet;
+        return newUser;
       });
 
-      // Log successful login
-      await this.activityLog.log(user.id, 'LOGIN_SUCCESS', {
-        squad_virtual_account: user.squad_virtual_account,
-      });
-      await this.activityLog.log(user.id, 'KYC_BVN_VERIFIED', {
-        source: 'signup_virtual_account',
+      await this.activityLog.log(user.id, 'ACCOUNT_CREATED', {
+        intent,
+        kyc_status: 'NOT_STARTED',
       });
 
-      // Generate tokens
-      const accessToken = this.jwtService.generateAccessToken(
+      const session = await this.issueSession(
         user.id,
         user.phone,
-      );
-      const refreshToken = uuidv4();
-      await this.redisService.set(
-        `refresh:${refreshToken}`,
-        user.id,
-        this.REFRESH_TOKEN_TTL,
+        deviceId,
       );
 
       return {
-        access_token: accessToken,
-        refresh_token: refreshToken,
-        user: this.formatUserResponse(user),
-        wallet: {
-          balance: user.wallet?.balance || 0n,
-          currency: 'NGN',
-        },
+        ...session,
+        user: await this.buildUserDto(user),
+        wallet: this.walletDto(user.wallet),
       };
     } catch (error: any) {
       if (error?.code === 'P2002') {
         const target = error?.meta?.target;
         const targets = Array.isArray(target) ? target : target ? [target] : [];
         if (targets.includes('username')) {
-          throw new ConflictException('Username is already taken');
+          throw apiError(
+            HttpStatus.CONFLICT,
+            'USERNAME_TAKEN',
+            'That username is already taken.',
+            { field: 'username' },
+          );
+        }
+        if (targets.includes('email')) {
+          throw apiError(
+            HttpStatus.CONFLICT,
+            'EMAIL_TAKEN',
+            'That email is already registered.',
+            { field: 'email' },
+          );
+        }
+        if (targets.includes('phone')) {
+          throw apiError(
+            HttpStatus.CONFLICT,
+            'ACCOUNT_EXISTS',
+            'This number already has an account. Log in instead.',
+            { field: 'phone' },
+          );
         }
       }
+      if (error?.status) throw error;
       const message = error instanceof Error ? error.message : 'Unknown error';
-      throw new BadRequestException(
-        'Signup failed: ' + message,
+      throw apiError(
+        HttpStatus.INTERNAL_SERVER_ERROR,
+        'INTERNAL_ERROR',
+        'Could not create the account. Please try again.',
+        { cause: message },
       );
     }
   }
 
+  // ── test accounts ────────────────────────────────────────────
+
   /**
    * TEST ONLY - sign in as one of the preset accounts, no OTP.
-   * Creates the user (and wallet) on first use. Disabled unless test auth is on.
+   * Disabled unless test auth is on.
    */
-  async testLogin(account?: string): Promise<any> {
+  async testLogin(account?: string, deviceId?: string) {
     if (!isTestAuthEnabled()) {
       // 404 rather than 403 so the route is not advertised on real deployments.
-      throw new NotFoundException('Not found');
+      throw apiError(HttpStatus.NOT_FOUND, 'NOT_FOUND', 'Not found');
     }
 
     const preset = resolveTestAccount(account);
     if (!preset) {
-      throw new BadRequestException(
+      throw apiError(
+        HttpStatus.BAD_REQUEST,
+        'VALIDATION_ERROR',
         'Unknown test account. Use 1, 2, 3, a phone number, or a username from GET /auth/test-accounts.',
+        { field: 'account' },
       );
     }
 
-    let user = await (this.prisma as any).user.findUnique({
-      where: { phone: preset.phone },
+    const normalizedPhone = normalizeNgPhone(preset.phone);
+
+    let user = await this.prisma.user.findUnique({
+      where: { phone: normalizedPhone },
       include: { wallet: true },
     });
 
+    // Rows created before phone normalization stored the raw preset phone.
+    if (!user && preset.phone !== normalizedPhone) {
+      const legacyUser = await this.prisma.user.findUnique({
+        where: { phone: preset.phone },
+        include: { wallet: true },
+      });
+      if (legacyUser) {
+        try {
+          user = await this.prisma.user.update({
+            where: { id: legacyUser.id },
+            data: { phone: normalizedPhone },
+            include: { wallet: true },
+          });
+        } catch (error: any) {
+          if (error?.code !== 'P2002') throw error;
+          user = legacyUser;
+        }
+      }
+    }
+
     if (!user) {
       try {
-        user = await (this.prisma as any).user.create({
+        user = await this.prisma.user.create({
           data: {
-            phone: preset.phone,
+            phone: normalizedPhone,
             username: preset.username,
             first_name: preset.first_name,
             last_name: preset.last_name,
             email: preset.email,
             avatar_url: buildDefaultAvatarUrl(preset.username),
             kyc_verified: false,
+            kyc_status: 'NOT_STARTED',
+            kyc_tier: 0,
           },
           include: { wallet: true },
         });
       } catch (error: any) {
-        if (error?.code !== 'P2002') {
-          throw error;
-        }
-        // Concurrent creation or username already used by another phone: reuse the row.
-        user = await (this.prisma as any).user.findFirst({
-          where: { OR: [{ phone: preset.phone }, { username: preset.username }] },
+        if (error?.code !== 'P2002') throw error;
+        user = await this.prisma.user.findFirst({
+          where: {
+            OR: [{ phone: normalizedPhone }, { username: preset.username }],
+          },
           include: { wallet: true },
         });
         if (!user) {
-          throw new ConflictException('Could not provision test account');
+          throw apiError(
+            HttpStatus.CONFLICT,
+            'CONFLICT',
+            'Could not provision test account.',
+          );
         }
       }
     }
 
     if (!user.wallet) {
-      const wallet = await (this.prisma as any).wallet.create({
-        data: {
-          user_id: user.id,
-          balance: 0n,
-          currency: 'NGN',
-        },
+      const wallet = await this.prisma.wallet.create({
+        data: { user_id: user.id, balance: 0n, currency: 'NGN' },
       });
       user.wallet = wallet;
     }
 
-    const accessToken = this.jwtService.generateAccessToken(user.id, user.phone);
-    const refreshToken = uuidv4();
-    await this.redisService.set(
-      `refresh:${refreshToken}`,
-      user.id,
-      this.REFRESH_TOKEN_TTL,
-    );
+    const session = await this.issueSession(user.id, user.phone, deviceId);
 
     await this.activityLog.log(user.id, 'LOGIN_SUCCESS', {
       test_mode: true,
@@ -381,22 +641,15 @@ export class AuthService {
     });
 
     return {
-      access_token: accessToken,
-      refresh_token: refreshToken,
-      user: this.formatUserResponse(user),
-      wallet: {
-        balance: user.wallet?.balance || 0n,
-        currency: 'NGN',
-      },
+      ...session,
+      user: await this.buildUserDto(user),
+      wallet: this.walletDto(user.wallet),
     };
   }
 
-  /**
-   * TEST ONLY - list the preset accounts and the fixed OTP.
-   */
-  listTestAccounts(): any {
+  listTestAccounts() {
     if (!isTestAuthEnabled()) {
-      throw new NotFoundException('Not found');
+      throw apiError(HttpStatus.NOT_FOUND, 'NOT_FOUND', 'Not found');
     }
     return {
       test_mode: true,
@@ -405,87 +658,161 @@ export class AuthService {
     };
   }
 
+  // ── sessions ─────────────────────────────────────────────────
+
   /**
-   * Refresh access token
-   * Token rotation: old refresh token invalidated immediately
+   * Rotate the token pair. Replaying an already-rotated token revokes the whole
+   * session family (requirements 3.4 / 7.2).
    */
-  async refreshAccessToken(data: RefreshTokenDto): Promise<any> {
-    const { refresh_token } = data;
+  async refreshAccessToken(data: RefreshTokenDto, deviceId?: string) {
+    const refreshToken = (data.refreshToken ?? data.refresh_token ?? '').trim();
 
-    // Get user ID from Redis
-    const userId = await this.redisService.get<string>(`refresh:${refresh_token}`);
-
-    if (!userId) {
-      throw new UnauthorizedException(
-        'Invalid or expired refresh token',
+    if (!refreshToken) {
+      throw apiError(
+        HttpStatus.BAD_REQUEST,
+        'VALIDATION_ERROR',
+        'refreshToken is required.',
+        { field: 'refreshToken' },
       );
     }
 
-    // Get user
-    const user = await this.prisma.user.findUnique({
-      where: { id: userId },
-    });
+    const stored = await this.redisService.get<any>(`refresh:${refreshToken}`);
 
-    if (!user) {
-      throw new UnauthorizedException('User not found');
+    if (!stored) {
+      const used = await this.redisService.get<any>(
+        `refresh_used:${refreshToken}`,
+      );
+      if (used?.family) {
+        await this.revokeFamily(used.family);
+        await this.activityLog.log(used.user_id, 'REFRESH_REUSE_DETECTED', {
+          family: used.family,
+        });
+      }
+      throw apiError(
+        HttpStatus.UNAUTHORIZED,
+        'REFRESH_INVALID',
+        'Please log in again.',
+      );
     }
 
-    // Invalidate old token immediately
-    await this.redisService.del(`refresh:${refresh_token}`);
+    const userId = String(stored.user_id ?? stored);
+    const sessionDid: string | null = stored.did ?? null;
+    const family: string = stored.family ?? uuidv4();
 
-    // Issue new tokens
-    const newAccessToken = this.jwtService.generateAccessToken(
-      user.id,
-      user.phone,
-    );
-    const newRefreshToken = uuidv4();
+    if (sessionDid && String(sessionDid) !== String(deviceId ?? '')) {
+      throw apiError(
+        HttpStatus.UNAUTHORIZED,
+        'REFRESH_INVALID',
+        'Please log in again.',
+        { reason: 'device_mismatch' },
+      );
+    }
+
+    const user = await this.prisma.user.findUnique({ where: { id: userId } });
+    if (!user) {
+      throw apiError(
+        HttpStatus.UNAUTHORIZED,
+        'REFRESH_INVALID',
+        'Please log in again.',
+      );
+    }
+
+    // Old token dies now; a replay of it hits the used-marker above.
+    await this.redisService.del(`refresh:${refreshToken}`);
     await this.redisService.set(
-      `refresh:${newRefreshToken}`,
-      user.id,
+      `refresh_used:${refreshToken}`,
+      { family, user_id: userId },
       this.REFRESH_TOKEN_TTL,
     );
 
-    // Log token refresh
     await this.activityLog.log(user.id, 'TOKEN_REFRESHED');
 
-    return {
-      access_token: newAccessToken,
-      refresh_token: newRefreshToken,
-    };
+    return this.issueSession(user.id, user.phone, sessionDid || deviceId, family);
   }
 
-  /**
-   * Logout - delete refresh token from Redis
-   */
-  async logout(refreshToken: string): Promise<any> {
-    const userId = await this.redisService.get<string>(`refresh:${refreshToken}`);
+  /** Idempotent: revokes the presented refresh token if it exists. */
+  async logout(refreshToken?: string) {
+    const token = (refreshToken ?? '').trim();
+    if (!token) return;
 
-    if (userId) {
-      await this.redisService.del(`refresh:${refreshToken}`);
+    const stored = await this.redisService.get<any>(`refresh:${token}`);
+    if (stored) {
+      const userId = String(stored.user_id ?? stored);
+      await this.redisService.del(`refresh:${token}`);
       await this.activityLog.log(userId, 'LOGOUT');
     }
+  }
+
+  private async issueSession(
+    userId: string,
+    phone: string,
+    deviceId?: string,
+    family?: string,
+  ) {
+    const refreshToken = uuidv4();
+    const sessionFamily = family ?? uuidv4();
+
+    await this.redisService.set(
+      `refresh:${refreshToken}`,
+      { user_id: userId, did: deviceId || null, family: sessionFamily },
+      this.REFRESH_TOKEN_TTL,
+    );
+
+    const familyKey = `refresh_family:${sessionFamily}`;
+    const members =
+      (await this.redisService.get<string[]>(familyKey)) ?? [];
+    members.push(refreshToken);
+    await this.redisService.set(familyKey, members, this.REFRESH_TOKEN_TTL);
 
     return {
-      success: true,
-      message: 'Logged out successfully',
+      accessToken: this.jwtService.generateAccessToken(
+        userId,
+        phone,
+        deviceId,
+      ),
+      refreshToken,
+      expiresIn: this.accessTokenTtlSeconds,
     };
   }
 
-  /**
-   * Format user response (no sensitive data)
-   */
-  private formatUserResponse(user: any): any {
+  private async revokeFamily(family: string) {
+    const familyKey = `refresh_family:${family}`;
+    const members = (await this.redisService.get<string[]>(familyKey)) ?? [];
+
+    for (const token of members) {
+      await this.redisService.del(`refresh:${token}`);
+    }
+    await this.redisService.del(familyKey);
+  }
+
+  // ── response shaping ─────────────────────────────────────────
+
+  private walletDto(wallet: any) {
+    return {
+      balance: Number(wallet?.balance ?? 0),
+      currency: wallet?.currency ?? 'NGN',
+    };
+  }
+
+  private async buildUserDto(user: any) {
+    const trust = await this.trustService.forUser(user.id);
+
     return {
       id: user.id,
-      phone: user.phone,
+      phone: toE164(user.phone),
       username: user.username ?? null,
       first_name: user.first_name,
       last_name: user.last_name,
-      email: user.email,
+      email: user.email ?? null,
       avatar_url: resolveUserAvatarUrl(user),
-      squad_virtual_account: user.squad_virtual_account,
-      squad_bank_code: user.squad_bank_code,
-      kyc_verified: user.kyc_verified,
+      kyc_status:
+        user.kyc_status ?? (user.kyc_verified ? 'VERIFIED' : 'NOT_STARTED'),
+      kyc_verified: !!user.kyc_verified,
+      tier: Number(user.kyc_tier ?? (user.kyc_verified ? 1 : 0)),
+      trust_score: trust.trust_score,
+      trust_tier: trust.trust_tier,
+      squad_virtual_account: user.squad_virtual_account ?? null,
+      squad_bank_code: user.squad_bank_code ?? null,
     };
   }
 }

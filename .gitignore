@@ -33,3 +33,6 @@ Thumbs.db
 
 # Prisma
 .env.production.local
+
+# Local scratch (logs, probes, patch scripts)
+\tmp\

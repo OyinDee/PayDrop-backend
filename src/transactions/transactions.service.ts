@@ -2,7 +2,6 @@ import {
   Injectable,
   BadRequestException,
   NotFoundException,
-  UnprocessableEntityException,
   UnauthorizedException,
   Logger,
 } from '@nestjs/common';
@@ -16,6 +15,8 @@ import { WalletService } from '../wallet/wallet.service';
 import { NotificationsService } from '../notifications/notifications.service';
 import { normalizeNgPhone } from '../common/utils/phone.util';
 import { resolvePayoutNipCode } from '../common/utils/squad-bank-code.util';
+import { apiError } from '../common/errors/api-error';
+import { HttpStatus } from '@nestjs/common';
 
 /** Format kobo as a readable naira string: 50000 → "₦500.00" */
 function naira(kobo: number | bigint): string {
@@ -128,27 +129,134 @@ export class TransactionsService {
     };
   }
 
-  private formatTx(tx: any, viewerUserId?: string) {
+  private formatTx(
+    tx: any,
+    viewerUserId?: string,
+    profiles?: Map<string, any>,
+  ) {
+    const isSender =
+      viewerUserId && tx.sender_id ? tx.sender_id === viewerUserId : null;
+    const counterpartyId = isSender ? tx.recipient_id : tx.sender_id;
+
     return {
       id: tx.id,
-      sender_id: tx.sender_id,
-      recipient_id: tx.recipient_id,
+      amount: Number(tx.amount),
       amount_kobo: Number(tx.amount),
-      amount: Number(tx.amount) / 100,
-      type: tx.type,
+      currency: 'NGN',
       status: tx.status,
-      direction: viewerUserId
-        ? tx.sender_id === viewerUserId
-          ? 'debit'
-          : 'credit'
-        : null,
-      note: tx.note,
-      squad_ref: tx.squad_ref,
-      fraud_score: tx.fraud_score,
-      fraud_verdict: tx.verdict,
-      createdAt: tx.created_at,
-      updatedAt: tx.updated_at,
+      direction:
+        isSender === null ? null : isSender ? 'sent' : 'received',
+      type: tx.type,
+      note: tx.note ?? null,
+      sender_id: tx.sender_id ?? null,
+      recipient_id: tx.recipient_id ?? null,
+      counterparty: profiles?.get(counterpartyId) ?? null,
+      squad_ref: tx.squad_ref ?? null,
+      fraud_score: tx.fraud_score ?? null,
+      verdict: tx.verdict ?? 'ALLOW',
+      fraud_reason: tx.fraud_reason ?? null,
+      created_at: tx.created_at,
+      updated_at: tx.updated_at,
     };
+  }
+
+  /** Minimal public profile for everyone in a page of transactions. */
+  private async counterpartyProfiles(rows: any[]) {
+    const ids = new Set<string>();
+    for (const row of rows) {
+      if (row.sender_id) ids.add(row.sender_id);
+      if (row.recipient_id) ids.add(row.recipient_id);
+    }
+
+    const map = new Map<string, any>();
+    if (ids.size === 0) return map;
+
+    const users = await this.prisma.user.findMany({
+      where: { id: { in: Array.from(ids) } },
+      select: {
+        id: true,
+        first_name: true,
+        last_name: true,
+        username: true,
+        avatar_url: true,
+      },
+    });
+
+    for (const user of users as any[]) {
+      map.set(user.id, {
+        id: user.id,
+        first_name: user.first_name,
+        last_name: user.last_name ?? null,
+        username: user.username ?? null,
+        avatar_url: user.avatar_url ?? null,
+      });
+    }
+
+    return map;
+  }
+
+  /** The canonical transfer body the app reads (id, amount, recipient). */
+  private buildTransferResponse(tx: any, recipient: any) {
+    return {
+      id: tx.id,
+      amount: Number(tx.amount),
+      currency: 'NGN',
+      status: tx.status,
+      verdict: tx.verdict ?? 'ALLOW',
+      recipient: recipient
+        ? {
+            id: recipient.id,
+            first_name: recipient.first_name,
+            last_name: recipient.last_name ?? null,
+            username: recipient.username ?? null,
+            avatar_url: recipient.avatar_url ?? null,
+          }
+        : null,
+      created_at: tx.created_at ?? null,
+    };
+  }
+
+  /**
+   * Same key + same payload returns the original payment; same key with a
+   * different payload is a 409 (requirements 5.5).
+   */
+  private async findIdempotentTransfer(
+    senderId: string,
+    key: string,
+    recipientId: string,
+    amount: number,
+    note?: string | null,
+  ) {
+    const tx = await this.prisma.transaction.findUnique({
+      where: { idempotency_key: key },
+    });
+
+    if (!tx) return null;
+
+    if (tx.sender_id !== senderId) {
+      throw apiError(
+        HttpStatus.CONFLICT,
+        'IDEMPOTENCY_CONFLICT',
+        'That idempotency key belongs to another payment.',
+        { idempotency_key: key },
+      );
+    }
+
+    const samePayload =
+      tx.recipient_id === recipientId &&
+      Number(tx.amount) === Number(amount) &&
+      (tx.note ?? null) === (note ?? null);
+
+    if (!samePayload) {
+      throw apiError(
+        HttpStatus.CONFLICT,
+        'IDEMPOTENCY_CONFLICT',
+        'This idempotency key was already used for a different payment.',
+        { idempotency_key: key, transaction_id: tx.id },
+      );
+    }
+
+    return tx;
   }
 
   // ─────────────────────────────────────────────────────────────
@@ -322,19 +430,29 @@ export class TransactionsService {
     amount: number,
     note?: string,
     nipCode?: string,
+    clientIdempotencyKey?: string,
   ) {
     if (recipientId === senderId) {
-      throw new BadRequestException('Cannot transfer to yourself');
+      throw apiError(
+        HttpStatus.BAD_REQUEST,
+        'VALIDATION_ERROR',
+        'You cannot send money to yourself.',
+        { field: 'recipient_id' },
+      );
     }
 
-    const idempotencyKey = uuidv4();
     const amountKobo = BigInt(amount);
 
     if (amountKobo <= 0n) {
-      throw new BadRequestException(
-        'Amount must be greater than zero (value is in kobo)',
+      throw apiError(
+        HttpStatus.BAD_REQUEST,
+        'VALIDATION_ERROR',
+        'Amount must be greater than zero (value is in kobo).',
+        { field: 'amount' },
       );
     }
+
+    const idempotencyKey = (clientIdempotencyKey ?? '').trim() || uuidv4();
 
     const sender = await this.prisma.user.findUnique({
       where: { id: senderId },
@@ -346,6 +464,42 @@ export class TransactionsService {
       where: { id: recipientId },
     });
     if (!recipient) throw new NotFoundException('Recipient not found');
+
+    if (clientIdempotencyKey) {
+      const replay = await this.findIdempotentTransfer(
+        senderId,
+        idempotencyKey,
+        recipientId,
+        Number(amountKobo),
+        note,
+      );
+      if (replay) {
+        return this.buildTransferResponse(replay, recipient);
+      }
+
+      const reserved = await this.redis.setIfNotExists(
+        `idem_lock:${senderId}:${idempotencyKey}`,
+        '1',
+        60,
+      );
+      if (!reserved) {
+        const raced = await this.findIdempotentTransfer(
+          senderId,
+          idempotencyKey,
+          recipientId,
+          Number(amountKobo),
+          note,
+        );
+        if (raced) return this.buildTransferResponse(raced, recipient);
+
+        throw apiError(
+          HttpStatus.CONFLICT,
+          'CONFLICT',
+          'That payment is already being processed. Check its status before retrying.',
+          { idempotency_key: idempotencyKey },
+        );
+      }
+    }
 
     const fraud = await this.fraud.scoreTransaction({
       idempotency_key: idempotencyKey,
@@ -362,7 +516,7 @@ export class TransactionsService {
 
     // ── BLOCK ──────────────────────────────────────────────────
     if (fraud.verdict === 'BLOCK') {
-      await this.prisma.transaction.create({
+      const blockedTx = await this.prisma.transaction.create({
         data: {
           sender_id: senderId,
           recipient_id: recipientId,
@@ -390,11 +544,17 @@ export class TransactionsService {
         `Your transfer of ${naira(amountKobo)} was blocked for security reasons. Contact support if you think this is an error.`,
       );
 
-      throw new UnprocessableEntityException({
-        error: fraud.reason,
-        fraud_score: fraud.score,
-        verdict: 'BLOCK',
-      });
+      throw apiError(
+        HttpStatus.UNPROCESSABLE_ENTITY,
+        'TRANSFER_BLOCKED',
+        fraud.reason || 'This payment was blocked for security reasons.',
+        {
+          transaction_id: blockedTx.id,
+          verdict: 'BLOCK',
+          status: 'BLOCKED',
+          fraud_score: fraud.score,
+        },
+      );
     }
 
     // ── FLAG ───────────────────────────────────────────────────
@@ -449,13 +609,22 @@ export class TransactionsService {
       );
 
       return {
-        idempotency_key: idempotencyKey,
-        transaction_id: tx.id,
+        ...this.buildTransferResponse(tx, recipient),
+        id: tx.id,
         status: 'PENDING_REVIEW',
         fraud_score: fraud.score,
         verdict: 'FLAG',
         reason: fraud.reason,
+        message: fraud.reason,
         confirm_token: confirmToken,
+        confirm_token_expires_at: new Date(
+          Date.now() + this.CONFIRM_TTL_SECONDS * 1000,
+        ).toISOString(),
+        expires_at: new Date(
+          Date.now() + this.CONFIRM_TTL_SECONDS * 1000,
+        ).toISOString(),
+        idempotency_key: idempotencyKey,
+        transaction_id: tx.id,
       };
     }
 
@@ -578,13 +747,15 @@ export class TransactionsService {
     );
 
     return {
-      idempotency_key: idempotencyKey,
-      transaction_id: created.txRow.id,
+      ...this.buildTransferResponse(created.txRow, recipient),
+      id: created.txRow.id,
       status: 'PENDING',
       fraud_score: fraud.score,
       verdict: 'ALLOW',
       squad_ref: created.squadRef,
       nip_transaction_reference: created.nipRef,
+      idempotency_key: idempotencyKey,
+      transaction_id: created.txRow.id,
     };
   }
 
@@ -613,12 +784,14 @@ export class TransactionsService {
 
     if (tx.status !== 'PENDING_REVIEW') {
       return {
-        idempotency_key: tx.idempotency_key,
-        transaction_id: tx.id,
+        id: tx.id,
+        amount: Number(tx.amount),
         status: tx.status,
         fraud_score: tx.fraud_score,
         verdict: tx.verdict,
         squad_ref: tx.squad_ref,
+        idempotency_key: tx.idempotency_key,
+        transaction_id: tx.id,
       };
     }
 
@@ -706,71 +879,99 @@ export class TransactionsService {
     );
 
     return {
-      idempotency_key: initiated.updated.idempotency_key,
-      transaction_id: initiated.updated.id,
+      ...this.buildTransferResponse(initiated.updated, recipient),
+      id: initiated.updated.id,
       status: initiated.updated.status,
       fraud_score: initiated.updated.fraud_score,
       verdict: initiated.updated.verdict,
       squad_ref: initiated.squadRef,
+      idempotency_key: initiated.updated.idempotency_key,
+      transaction_id: initiated.updated.id,
     };
   }
 
-async getTransactions(userId: string, page: number = 1, limit: number = 20) {
-  // Default page to 1 if less than 1
-  if (page < 1) {
-    page = 1;
-  }
-  
-  // Clamp limit between 1 and 100
-  if (limit < 1 || limit > 100) {
-    limit = Math.min(Math.max(limit, 1), 100);
-  }
+async getTransactions(userId: string, page: number = 1, limit: number = 10) {
+    if (page < 1) page = 1;
+    limit = Math.min(Math.max(Number(limit) || 10, 1), 100);
 
-  const skip = (page - 1) * limit;
+    const skip = (page - 1) * limit;
+    const where = {
+      OR: [{ sender_id: userId }, { recipient_id: userId }],
+    };
 
-  const [transactions, total] = await Promise.all([
-    this.prisma.transaction.findMany({
-      where: {
-        OR: [{ sender_id: userId }, { recipient_id: userId }],
+    const [transactions, total] = await Promise.all([
+      this.prisma.transaction.findMany({
+        where,
+        skip,
+        take: limit,
+        orderBy: { created_at: 'desc' },
+      }),
+      this.prisma.transaction.count({ where }),
+    ]);
+
+    const profiles = await this.counterpartyProfiles(transactions as any[]);
+
+    return {
+      transactions: transactions.map((tx: any) =>
+        this.formatTx(tx, userId, profiles),
+      ),
+      total,
+      page,
+      limit,
+      pagination: {
+        page,
+        limit,
+        total,
+        total_pages: Math.ceil(total / limit),
       },
-      skip,
-      take: limit,
-      orderBy: { created_at: 'desc' },
-    }),
-    this.prisma.transaction.count({
-      where: {
-        OR: [{ sender_id: userId }, { recipient_id: userId }],
-      },
-    }),
-  ]);
+    };
+  }
 
-  return {
-    transactions: transactions.map((tx: any) => ({
-      id: tx.id,
-      sender_id: tx.sender_id,
-      recipient_id: tx.recipient_id,
-      amount: tx.amount,
-      status: tx.status,
-      note: tx.note,
-      squad_ref: tx.squad_ref,
-      fraud_score: tx.fraud_score,
-      fraud_verdict: tx.verdict,
-      createdAt: tx.created_at,
-      updatedAt: tx.updated_at,
-    })),
-    total,
-    page,
-    limit,
-  };
-}
+  /**
+   * GET /transactions/by-idempotency-key/:key — recovery when the submit
+   * response never arrived. Scoped to the caller; a stranger's key is a 404.
+   */
+  async getTransactionByIdempotencyKey(userId: string, key: string) {
+    const tx = await this.prisma.transaction.findUnique({
+      where: { idempotency_key: key },
+    });
+
+    if (!tx || (tx.sender_id !== userId && tx.recipient_id !== userId)) {
+      throw apiError(
+        HttpStatus.NOT_FOUND,
+        'NOT_FOUND',
+        'No payment found for that idempotency key.',
+        { idempotency_key: key },
+      );
+    }
+
+    const profiles = await this.counterpartyProfiles([tx as any]);
+
+    return this.formatTx(tx, userId, profiles);
+  }
 
   async getTransaction(transactionId: string, viewerUserId?: string) {
     const transaction = await this.prisma.transaction.findUnique({
       where: { id: transactionId },
     });
-    if (!transaction) throw new NotFoundException('Transaction not found');
 
-    return this.formatTx(transaction, viewerUserId);
+    // A user may only read transactions they are part of.
+    if (
+      !transaction ||
+      (viewerUserId &&
+        transaction.sender_id !== viewerUserId &&
+        transaction.recipient_id !== viewerUserId)
+    ) {
+      throw apiError(
+        HttpStatus.NOT_FOUND,
+        'NOT_FOUND',
+        'Transaction not found.',
+      );
+    }
+
+    const profiles = await this.counterpartyProfiles([transaction as any]);
+
+    return this.formatTx(transaction, viewerUserId, profiles);
   }
 
   async getFraudDetail(transactionId: string) {

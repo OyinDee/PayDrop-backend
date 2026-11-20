@@ -13,6 +13,24 @@ export class RedisService {
       throw new Error('REDIS_URL is not configured');
     }
 
+    let parsedRedisUrl: URL;
+    try {
+      parsedRedisUrl = new URL(redisUrl);
+    } catch {
+      throw new Error(
+        'REDIS_URL must contain only a valid Redis URL, such as rediss://default:<password>@<host>:6379. Do not include redis-cli flags or commands.',
+      );
+    }
+
+    if (
+      !['redis:', 'rediss:'].includes(parsedRedisUrl.protocol) ||
+      !parsedRedisUrl.hostname
+    ) {
+      throw new Error(
+        'REDIS_URL must use the redis:// or rediss:// scheme and include a host.',
+      );
+    }
+
     const connectTimeoutMs = Number(
       this.configService.get<string>('REDIS_CONNECT_TIMEOUT_MS') || 10000,
     );

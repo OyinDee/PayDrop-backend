@@ -1,153 +1,236 @@
-import { Injectable, BadRequestException } from '@nestjs/common';
+import { HttpStatus, Injectable } from '@nestjs/common';
 import { v4 as uuidv4 } from 'uuid';
 import { PrismaService } from '../common/prisma/prisma.service';
 import { RedisService } from '../common/services/redis.service';
+import { TrustService } from '../common/services/trust.service';
 import { resolveUserAvatarUrl } from '../common/utils/avatar.util';
+import { apiError } from '../common/errors/api-error';
+
+const UUID_RE =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+
+type DiscoveryKind = 'ble' | 'qr';
 
 @Injectable()
 export class DiscoverService {
+  /** BLE tokens live ~3 minutes; the app rotates roughly every 120 s. */
   private readonly BLE_TTL = 180;
-  private readonly BLE_KEY_PREFIX = 'ble:';
-  private readonly BLE_USER_KEY_PREFIX = 'ble_user:';
-  private readonly TRUST_KEY_PREFIX = 'trust:';
+  /** QR tokens are server-chosen minutes; kept independent of the BLE token. */
+  private readonly QR_TTL = 300;
+  /** Remember tokens after expiry so we can answer 410 instead of 404. */
+  private readonly SEEN_TTL = 86400;
 
   constructor(
     private readonly prisma: PrismaService,
     private readonly redis: RedisService,
+    private readonly trust: TrustService,
   ) {}
 
-  async registerToken(userId: string, token: string) {
-    if (!token || token.trim().length === 0) {
-      throw new BadRequestException('Token cannot be empty');
+  // ── registration ────────────────────────────────────────────
+
+  /**
+   * POST /discover/broadcast — register a discovery token for the signed-in
+   * user. The server issues the token when the body is empty (requirements Q5).
+   */
+  async registerToken(
+    userId: string,
+    token?: string,
+    kind: DiscoveryKind = 'ble',
+  ) {
+    const value = (token ?? '').trim() || uuidv4();
+
+    if (!UUID_RE.test(value)) {
+      throw apiError(
+        HttpStatus.BAD_REQUEST,
+        'TOKEN_MALFORMED',
+        'Discovery tokens must be a well-formed UUID.',
+        { field: 'token' },
+      );
     }
 
-    // Contract keys:
-    // ble:{token} -> userId (TTL 180s)
-    // ble_user:{userId} -> token (TTL 180s)
-    await this.redis.set(`${this.BLE_KEY_PREFIX}${token}`, userId, this.BLE_TTL);
-    await this.redis.set(`${this.BLE_USER_KEY_PREFIX}${userId}`, token, this.BLE_TTL);
+    const existing = await this.redis.get<any>(`discover:${value}`);
+    if (existing?.user_id && existing.user_id !== userId) {
+      throw apiError(
+        HttpStatus.CONFLICT,
+        'TOKEN_IN_USE',
+        'That discovery token is already registered to another account.',
+      );
+    }
+
+    const ttl = kind === 'qr' ? this.QR_TTL : this.BLE_TTL;
+    const record = { user_id: userId, kind };
+
+    await this.redis.set(`discover:${value}`, record, ttl);
+    await this.redis.set(`discover_seen:${value}`, record, this.SEEN_TTL);
+    await this.redis.set(`discover_user:${kind}:${userId}`, value, ttl);
 
     return {
-      success: true,
-      expires_in: this.BLE_TTL,
+      token: value,
+      ttl,
+      expires_in: ttl,
+      expires_at: new Date(Date.now() + ttl * 1000).toISOString(),
     };
   }
 
-  async resolveTokens(requesterUserId: string, tokens: string[]) {
-    if (!Array.isArray(tokens) || tokens.length === 0) {
-      return { users: [] };
+  /** DELETE /discover/broadcast — stop being discoverable, account-wide. */
+  async removeTokensForUser(userId: string) {
+    const keys: string[] = [];
+
+    for (const kind of ['ble', 'qr'] as DiscoveryKind[]) {
+      const userKey = `discover_user:${kind}:${userId}`;
+      const token = await this.redis.get<string>(userKey);
+      if (token) {
+        keys.push(`discover:${token}`, userKey);
+      }
     }
 
-    const keys = tokens.map((t) => `${this.BLE_KEY_PREFIX}${t}`);
-    const resolved = await this.redis.mget<string>(keys);
-    const userIds = resolved.filter((id): id is string => Boolean(id));
-
-    // Filter out requester (contract requirement)
-    const filteredUserIds = userIds.filter((id) => id !== requesterUserId);
-
-    if (filteredUserIds.length === 0) {
-      return { users: [] };
+    if (keys.length > 0) {
+      await this.redis.del(keys);
     }
 
-    const users = await this.prisma.user.findMany({
-      where: {
-        id: {
-          in: filteredUserIds,
-        },
-      },
-      select: {
-        id: true,
-        username: true,
-        first_name: true,
-        last_name: true,
-        avatar_url: true,
-      },
-    });
-
-    const trustKeys = users.map((u: { id: string }) => `${this.TRUST_KEY_PREFIX}${u.id}`);
-    const trustValues = await this.redis.mget<string>(trustKeys);
-
-    return {
-      users: users.map((u: { id: string; username: string | null; first_name: string; last_name: string; avatar_url: string | null }, idx: number) => ({
-        id: u.id,
-        username: u.username ?? null,
-        first_name: u.first_name,
-        last_name: u.last_name,
-        avatar_url: resolveUserAvatarUrl(u),
-        trust_tier: trustValues[idx] || 'MEDIUM',
-      })),
-    };
+    return { success: true };
   }
 
+  // ── QR ──────────────────────────────────────────────────────
+
+  /**
+   * GET /discover/qr — short-lived QR payload. Issuing a QR does not touch the
+   * live BLE token (requirements Q6).
+   */
   async getQrToken(userId: string) {
-    // Return existing token if still valid, else generate a new one.
-    let token = await this.redis.get<string>(`${this.BLE_USER_KEY_PREFIX}${userId}`);
+    const existing = await this.redis.get<string>(`discover_user:qr:${userId}`);
+    let token = existing;
+
     if (!token) {
       token = uuidv4();
-      await this.redis.set(`${this.BLE_KEY_PREFIX}${token}`, userId, this.BLE_TTL);
-      await this.redis.set(`${this.BLE_USER_KEY_PREFIX}${userId}`, token, this.BLE_TTL);
+      await this.redis.set(
+        `discover:${token}`,
+        { user_id: userId, kind: 'qr' },
+        this.QR_TTL,
+      );
+      await this.redis.set(
+        `discover_seen:${token}`,
+        { user_id: userId, kind: 'qr' },
+        this.SEEN_TTL,
+      );
+      await this.redis.set(`discover_user:qr:${userId}`, token, this.QR_TTL);
     }
 
     return {
+      qr: `paydrop://discover?token=${token}`,
       token,
-      qr_payload: Buffer.from(token).toString('base64'),
+      ttl: this.QR_TTL,
+      expires_in: this.QR_TTL,
+      expires_at: new Date(Date.now() + this.QR_TTL * 1000).toISOString(),
     };
   }
 
-  async resolveQrToken(token: string) {
-    if (!token || token.trim().length === 0) {
-      throw new BadRequestException('Token cannot be empty');
+  // ── resolution ──────────────────────────────────────────────
+
+  /**
+   * POST /discover/resolve — turn one token into the minimal public profile
+   * the review card shows. Never returns phone, email, bank or balance.
+   */
+  async resolveToken(viewerUserId: string, token: string) {
+    const value = (token ?? '').trim();
+
+    if (!value) {
+      throw apiError(
+        HttpStatus.BAD_REQUEST,
+        'VALIDATION_ERROR',
+        'A discovery token is required.',
+        { field: 'token' },
+      );
     }
 
-    const userId = await this.redis.get<string>(`${this.BLE_KEY_PREFIX}${token}`);
+    const record = await this.redis.get<any>(`discover:${value}`);
 
-    if (!userId) {
-      throw new BadRequestException('Token expired or invalid');
+    if (!record?.user_id) {
+      const seen = await this.redis.get<any>(`discover_seen:${value}`);
+      if (seen) {
+        throw apiError(
+          HttpStatus.GONE,
+          'TOKEN_EXPIRED',
+          'That code has expired. Ask them to show a new one.',
+        );
+      }
+      throw apiError(
+        HttpStatus.NOT_FOUND,
+        'TOKEN_INVALID',
+        'Code not recognised.',
+      );
     }
+
+    const targetId = String(record.user_id);
 
     const user = await this.prisma.user.findUnique({
-      where: { id: userId },
+      where: { id: targetId },
       select: {
         id: true,
-        username: true,
         first_name: true,
         last_name: true,
+        username: true,
         avatar_url: true,
       },
     });
 
     if (!user) {
-      throw new BadRequestException('User not found');
+      throw apiError(
+        HttpStatus.NOT_FOUND,
+        'TOKEN_INVALID',
+        'Code not recognised.',
+      );
     }
 
-    const trustTier =
-      (await this.redis.get<string>(`${this.TRUST_KEY_PREFIX}${user.id}`)) || 'MEDIUM';
+    const [relationship, trust, mutual] = await Promise.all([
+      this.trust.relationship(viewerUserId, targetId),
+      this.trust.forUser(targetId),
+      this.trust.mutualTrust(viewerUserId, targetId),
+    ]);
 
     return {
       user: {
         id: user.id,
-        username: user.username ?? null,
         first_name: user.first_name,
-        last_name: user.last_name,
+        last_name: user.last_name ?? null,
+        username: user.username ?? null,
         avatar_url: resolveUserAvatarUrl(user),
-        trust_tier: trustTier,
+        relationship,
+        trust_score: trust.trust_score,
+        trust_tier: trust.trust_tier,
+        mutual_trust: mutual,
       },
     };
   }
 
-  async removeTokenForUser(userId: string) {
-    const token = await this.redis.get<string>(`${this.BLE_USER_KEY_PREFIX}${userId}`);
-    if (!token) {
-      return { success: true };
-    }
+  /** Batch resolve used by BLE scanning (a single miss never fails the batch). */
+  async resolveTokens(viewerUserId: string, tokens: string[]) {
+    const unique = Array.from(
+      new Set((tokens ?? []).filter((t) => !!t && UUID_RE.test(t))),
+    );
 
-    await this.redis.del([
-      `${this.BLE_KEY_PREFIX}${token}`,
-      `${this.BLE_USER_KEY_PREFIX}${userId}`,
-    ]);
+    const results = await Promise.all(
+      unique.map(async (token) => {
+        try {
+          return {
+            token,
+            user: (await this.resolveToken(viewerUserId, token)).user,
+          };
+        } catch (error: any) {
+          return {
+            token,
+            user: null,
+            code: error?.response?.code ?? 'TOKEN_INVALID',
+          };
+        }
+      }),
+    );
 
     return {
-      success: true,
+      users: results.filter((r) => !!r.user).map((r) => r.user),
+      unresolved: results
+        .filter((r) => !r.user)
+        .map((r) => ({ token: r.token, code: r.code })),
     };
   }
 }

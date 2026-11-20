@@ -28,6 +28,14 @@ enum FraudVerdict {
   BLOCK
 }
 
+enum PaymentRequestStatus {
+  OPEN
+  PARTIALLY_PAID
+  PAID
+  CANCELLED
+  EXPIRED
+}
+
 enum ActivityLogOperation {
   OTP_REQUESTED
   OTP_VERIFIED
@@ -46,8 +54,8 @@ enum ActivityLogOperation {
   TRANSFER_FLAG_CONFIRMED
   TRANSFER_BLOCKED
   TRANSFER_COMPLETED
-  TRANSFER_RECEIVED  
-  TRANSFER_SENT   
+  TRANSFER_RECEIVED
+  TRANSFER_SENT
   TRANSFER_FAILED
   WALLET_FUNDED
   WITHDRAWAL_INITIATED
@@ -63,26 +71,37 @@ enum ActivityLogOperation {
 
 // Models
 model User {
-  id                    String        @id @default(uuid())
-  phone                 String        @unique
-  username              String?       @unique
+  id                    String   @id @default(uuid())
+  phone                 String   @unique
+  username              String?  @unique
   first_name            String
   last_name             String
-  email                 String?
+  email                 String? @unique
   avatar_url            String?
-  squad_virtual_account String?       @unique
+  squad_virtual_account String?  @unique
   squad_bank_code       String?
-  kyc_verified          Boolean       @default(false)
-  created_at            DateTime      @default(now())
-  updated_at            DateTime      @updatedAt
+  kyc_verified          Boolean  @default(false)
+  kyc_status            String   @default("NOT_STARTED") // NOT_STARTED | PENDING | VERIFIED | REJECTED
+  kyc_tier              Int      @default(0) // 0 = phone verified, 1 = KYC verified
+  kyc_bvn_encrypted     String?
+  kyc_bvn_last4         String?
+  kyc_rejection_reason  String?
+  kyc_submitted_at      DateTime?
+  kyc_verified_at       DateTime?
+  created_at            DateTime @default(now())
+  updated_at            DateTime @updatedAt
 
-  wallet                Wallet?
-  sent                  Transaction[] @relation("sent")
-  received              Transaction[] @relation("received")
-  activity_logs         ActivityLog[]
-  notifications         Notification[]
-  device_tokens         DeviceToken[]
-  fraud_events          FraudEvent[]
+  wallet                    Wallet?
+  sent                      Transaction[]         @relation("sent")
+  received                  Transaction[]         @relation("received")
+  activity_logs             ActivityLog[]
+  notifications             Notification[]
+  device_tokens             DeviceToken[]
+  fraud_events              FraudEvent[]
+  payment_requests_made     PaymentRequest[]      @relation("payment_requests_made")
+  payment_requests_received PaymentRequest[]      @relation("payment_requests_received")
+  payment_contributions     PaymentContribution[]
+  transfer_reactions        TransferReaction[]
 
   @@map("users")
 }
@@ -90,35 +109,37 @@ model User {
 model Wallet {
   id         String   @id @default(uuid())
   user_id    String   @unique
-  balance    BigInt   @default(0)   // KOBO always
+  balance    BigInt   @default(0) // KOBO always
   currency   String   @default("NGN")
   updated_at DateTime @updatedAt
 
-  user       User     @relation(fields: [user_id], references: [id], onDelete: Cascade)
+  user User @relation(fields: [user_id], references: [id], onDelete: Cascade)
 
   @@map("wallets")
 }
 
 model Transaction {
-  id               String            @id @default(uuid())
-  sender_id        String?
-  recipient_id     String?
-  amount           BigInt
-  type             TransactionType
-  status           TransactionStatus @default(PENDING)
-  idempotency_key  String            @unique
-  fraud_score      Int?
-  verdict          FraudVerdict?
-  fraud_reason     String?
-  confirm_token    String?
-  squad_ref        String?
-  note             String?
-  created_at       DateTime          @default(now())
-  updated_at       DateTime          @updatedAt
+  id              String            @id @default(uuid())
+  sender_id       String?
+  recipient_id    String?
+  amount          BigInt
+  type            TransactionType
+  status          TransactionStatus @default(PENDING)
+  idempotency_key String            @unique
+  fraud_score     Int?
+  verdict         FraudVerdict?
+  fraud_reason    String?
+  confirm_token   String?
+  squad_ref       String?
+  note            String?
+  created_at      DateTime          @default(now())
+  updated_at      DateTime          @updatedAt
 
-  sender           User?             @relation("sent",     fields: [sender_id],    references: [id])
-  recipient        User?             @relation("received", fields: [recipient_id], references: [id])
-  fraud_events     FraudEvent[]
+  sender       User?                @relation("sent", fields: [sender_id], references: [id])
+  recipient    User?                @relation("received", fields: [recipient_id], references: [id])
+  fraud_events FraudEvent[]
+  contribution PaymentContribution?
+  reactions    TransferReaction[]
 
   @@index([sender_id])
   @@index([recipient_id])
@@ -141,8 +162,8 @@ model FraudEvent {
   reviewed_at     DateTime?
   created_at      DateTime     @default(now())
 
-  transaction     Transaction  @relation(fields: [transaction_id], references: [id], onDelete: Cascade)
-  user            User         @relation(fields: [user_id],        references: [id])
+  transaction Transaction @relation(fields: [transaction_id], references: [id], onDelete: Cascade)
+  user        User        @relation(fields: [user_id], references: [id])
 
   @@index([transaction_id])
   @@index([verdict])
@@ -151,15 +172,15 @@ model FraudEvent {
 }
 
 model ActivityLog {
-  id          String               @id @default(uuid())
-  user_id     String
-  operation   ActivityLogOperation
-  metadata    Json?
-  ip_address  String?
-  device_id   String?
-  created_at  DateTime             @default(now())
+  id         String               @id @default(uuid())
+  user_id    String
+  operation  ActivityLogOperation
+  metadata   Json?
+  ip_address String?
+  device_id  String?
+  created_at DateTime             @default(now())
 
-  user        User                 @relation(fields: [user_id], references: [id])
+  user User @relation(fields: [user_id], references: [id])
 
   @@index([user_id])
   @@index([operation])
@@ -176,7 +197,7 @@ model Notification {
   read       Boolean  @default(false)
   created_at DateTime @default(now())
 
-  user       User     @relation(fields: [user_id], references: [id], onDelete: Cascade)
+  user User @relation(fields: [user_id], references: [id], onDelete: Cascade)
 
   @@index([user_id, read])
   @@map("notifications")
@@ -189,8 +210,62 @@ model DeviceToken {
   fcm_token  String
   updated_at DateTime @updatedAt
 
-  user       User     @relation(fields: [user_id], references: [id], onDelete: Cascade)
+  user User @relation(fields: [user_id], references: [id], onDelete: Cascade)
 
   @@unique([user_id, device_id])
   @@map("device_tokens")
+}
+
+model PaymentRequest {
+  id           String               @id @default(uuid())
+  requester_id String
+  payer_id     String?
+  amount       BigInt
+  note         String?
+  status       PaymentRequestStatus @default(OPEN)
+  share_code   String               @unique
+  expires_at   DateTime?
+  created_at   DateTime             @default(now())
+  updated_at   DateTime             @updatedAt
+
+  requester     User                  @relation("payment_requests_made", fields: [requester_id], references: [id], onDelete: Cascade)
+  payer         User?                 @relation("payment_requests_received", fields: [payer_id], references: [id])
+  contributions PaymentContribution[]
+
+  @@index([requester_id, status])
+  @@index([payer_id])
+  @@index([status])
+  @@map("payment_requests")
+}
+
+model PaymentContribution {
+  id             String   @id @default(uuid())
+  request_id     String
+  payer_id       String
+  amount         BigInt
+  transaction_id String   @unique
+  created_at     DateTime @default(now())
+
+  request     PaymentRequest @relation(fields: [request_id], references: [id], onDelete: Cascade)
+  payer       User           @relation(fields: [payer_id], references: [id])
+  transaction Transaction    @relation(fields: [transaction_id], references: [id])
+
+  @@index([request_id])
+  @@index([payer_id])
+  @@map("payment_contributions")
+}
+
+model TransferReaction {
+  id             String   @id @default(uuid())
+  transaction_id String
+  user_id        String
+  emoji          String
+  created_at     DateTime @default(now())
+
+  transaction Transaction @relation(fields: [transaction_id], references: [id], onDelete: Cascade)
+  user        User        @relation(fields: [user_id], references: [id], onDelete: Cascade)
+
+  @@unique([transaction_id, user_id, emoji])
+  @@index([transaction_id])
+  @@map("transfer_reactions")
 }

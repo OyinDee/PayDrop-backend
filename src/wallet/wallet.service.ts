@@ -41,10 +41,13 @@ export class WalletService {
     });
     if (!wallet) throw new NotFoundException('Wallet not found');
 
+    const kobo = Number(wallet.balance);
+
     return {
-      balance_kobo: Number(wallet.balance),
-      balance: Number(wallet.balance) / 100,
-      currency: wallet.currency,
+      // The app reads data.balance and expects integer kobo.
+      balance: kobo,
+      balance_kobo: kobo,
+      currency: wallet.currency ?? 'NGN',
     };
   }
 
@@ -269,6 +272,7 @@ export class WalletService {
       recipient_id: string;
       amount: bigint;
       id: string;
+      insufficient?: boolean;
     };
 
     const snapshot = await this.prisma.$transaction<P2pSnapshot | null>(
@@ -288,10 +292,30 @@ export class WalletService {
           );
         }
 
-        await tx.wallet.update({
-          where: { user_id: row.sender_id },
+        // The sender may have spent the money between initiating the transfer
+        // and this settlement. Only debit when the funds are still there.
+        const debited = await tx.wallet.updateMany({
+          where: {
+            user_id: row.sender_id,
+            balance: { gte: row.amount },
+          },
           data: { balance: { decrement: row.amount } },
         });
+
+        if (debited.count === 0) {
+          await tx.transaction.update({
+            where: { id: transactionId },
+            data: { status: 'PENDING_REVIEW' },
+          });
+          return {
+            sender_id: row.sender_id,
+            recipient_id: row.recipient_id,
+            amount: row.amount,
+            id: row.id,
+            insufficient: true,
+          };
+        }
+
         await tx.wallet.update({
           where: { user_id: row.recipient_id },
           data: { balance: { increment: row.amount } },
@@ -305,6 +329,15 @@ export class WalletService {
         };
       },
     );
+
+    if (snapshot?.insufficient) {
+      await this.activityLog.log(snapshot.sender_id, 'TRANSFER_FLAGGED', {
+        transaction_id: snapshot.id,
+        amount: Number(snapshot.amount),
+        reason: 'insufficient_balance_at_settlement',
+      });
+      return false;
+    }
 
     if (snapshot) {
       await this.activityLog.log(snapshot.sender_id, 'TRANSFER_COMPLETED', {
@@ -370,10 +403,12 @@ export class WalletService {
 
     const newStatus = status === 'success' ? 'COMPLETED' : 'FAILED';
 
-    await this.prisma.transaction.update({
-      where: { id: transaction.id },
+    // Idempotent: a replayed webhook must not credit the wallet twice.
+    const updated = await this.prisma.transaction.updateMany({
+      where: { id: transaction.id, status: 'PENDING' },
       data: { status: newStatus },
     });
+    if (updated.count === 0) return;
 
     if (newStatus === 'COMPLETED') {
       await this.activityLog.log(
