@@ -229,7 +229,10 @@ export class TransactionsController {
   })
   @ApiResponse({ status: 404, description: 'Transaction not found or no fraud data' })
   @ApiResponse({ status: 401, description: 'Unauthorized' })
-  async getFraudDetail(@Param('id') id: string) {
-    return this.transactionsService.getFraudDetail(id);
+  async getFraudDetail(
+    @CurrentUser('sub') userId: string,
+    @Param('id') id: string,
+  ) {
+    return this.transactionsService.getFraudDetail(id, userId);
   }
 }

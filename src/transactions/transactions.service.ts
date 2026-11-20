@@ -452,6 +452,10 @@ export class TransactionsService {
       );
     }
 
+    // Tier gating (requirements 4.4). A limit of 0 means "not configured yet",
+    // so an unset tier never blocks payments.
+    await this.assertWithinTierLimits(senderId, amountKobo);
+
     const idempotencyKey = (clientIdempotencyKey ?? '').trim() || uuidv4();
 
     const sender = await this.prisma.user.findUnique({
@@ -950,6 +954,66 @@ async getTransactions(userId: string, page: number = 1, limit: number = 10) {
     return this.formatTx(tx, userId, profiles);
   }
 
+  private tierLimits(tier: number) {
+    const prefix = tier >= 1 ? 'KYC_TIER1' : 'KYC_TIER0';
+    return {
+      per_transfer: Number(process.env[`${prefix}_PER_TRANSFER`] || 0),
+      daily: Number(process.env[`${prefix}_DAILY`] || 0),
+    };
+  }
+
+  private async assertWithinTierLimits(senderId: string, amountKobo: bigint) {
+    const user = await this.prisma.user.findUnique({
+      where: { id: senderId },
+      select: { kyc_tier: true, kyc_verified: true },
+    });
+
+    const tier = Number(user?.kyc_tier ?? (user?.kyc_verified ? 1 : 0));
+    const limits = this.tierLimits(tier);
+
+    if (limits.per_transfer > 0 && amountKobo > BigInt(limits.per_transfer)) {
+      throw apiError(
+        HttpStatus.FORBIDDEN,
+        'KYC_REQUIRED',
+        'This amount is above your current limit. Verify your identity to raise it.',
+        {
+          required_tier: tier + 1,
+          limit: limits.per_transfer,
+          attempted: Number(amountKobo),
+        },
+      );
+    }
+
+    if (limits.daily > 0) {
+      const startOfDay = new Date();
+      startOfDay.setUTCHours(0, 0, 0, 0);
+
+      const sent = await this.prisma.transaction.aggregate({
+        where: {
+          sender_id: senderId,
+          created_at: { gte: startOfDay },
+          status: { in: ['COMPLETED', 'PROCESSING', 'PENDING'] as any },
+        },
+        _sum: { amount: true },
+      });
+
+      const total = BigInt(sent._sum.amount ?? 0) + amountKobo;
+
+      if (total > BigInt(limits.daily)) {
+        throw apiError(
+          HttpStatus.FORBIDDEN,
+          'KYC_REQUIRED',
+          'This payment would exceed your daily limit. Verify your identity to raise it.',
+          {
+            required_tier: tier + 1,
+            limit: limits.daily,
+            attempted: Number(amountKobo),
+          },
+        );
+      }
+    }
+  }
+
   async getTransaction(transactionId: string, viewerUserId?: string) {
     const transaction = await this.prisma.transaction.findUnique({
       where: { id: transactionId },
@@ -974,11 +1038,24 @@ async getTransactions(userId: string, page: number = 1, limit: number = 10) {
     return this.formatTx(transaction, viewerUserId, profiles);
   }
 
-  async getFraudDetail(transactionId: string) {
+  async getFraudDetail(transactionId: string, viewerUserId?: string) {
     const transaction = await this.prisma.transaction.findUnique({
       where: { id: transactionId },
     });
-    if (!transaction) throw new NotFoundException('Transaction not found');
+
+    // A user may only read fraud detail for their own transactions.
+    if (
+      !transaction ||
+      (viewerUserId &&
+        transaction.sender_id !== viewerUserId &&
+        transaction.recipient_id !== viewerUserId)
+    ) {
+      throw apiError(
+        HttpStatus.NOT_FOUND,
+        'NOT_FOUND',
+        'Transaction not found.',
+      );
+    }
 
     const fraudEvent = await this.prisma.fraudEvent.findFirst({
       where: { transaction_id: transactionId },
@@ -994,6 +1071,7 @@ async getTransactions(userId: string, page: number = 1, limit: number = 10) {
       );
       return {
         score: fraudEvent.score,
+        fraud_score: fraudEvent.score,
         verdict: fraudEvent.verdict,
         reason: fraudEvent.reason,
         features: fraudEvent.features as Record<string, unknown>,
@@ -1018,6 +1096,7 @@ async getTransactions(userId: string, page: number = 1, limit: number = 10) {
       );
       return {
         score: transaction.fraud_score ?? 0,
+        fraud_score: transaction.fraud_score ?? 0,
         verdict: transaction.verdict ?? 'ALLOW',
         reason:
           transaction.fraud_reason ??
@@ -1029,6 +1108,10 @@ async getTransactions(userId: string, page: number = 1, limit: number = 10) {
       };
     }
 
-    throw new NotFoundException('No fraud scoring data for this transaction');
+    throw apiError(
+      HttpStatus.NOT_FOUND,
+      'NO_FRAUD_DATA',
+      'No fraud scoring data for this transaction.',
+    );
   }
 }

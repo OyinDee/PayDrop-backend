@@ -5,7 +5,10 @@ import {
   Body,
   Headers,
   HttpCode,
+  Req,
 } from '@nestjs/common';
+import { RedisService } from '../common/services/redis.service';
+import { enforceRateLimit } from '../common/utils/rate-limit.util';
 import {
   ApiTags,
   ApiOperation,
@@ -34,7 +37,10 @@ import {
 })
 @Controller('auth')
 export class AuthController {
-  constructor(private authService: AuthService) {}
+  constructor(
+    private authService: AuthService,
+    private readonly redis: RedisService,
+  ) {}
 
   @Post('check-availability')
   @HttpCode(200)
@@ -45,7 +51,21 @@ export class AuthController {
   })
   @ApiBody({ type: CheckAvailabilityDto })
   @ApiResponse({ status: 200, type: AvailabilityFieldDto })
-  async checkAvailability(@Body() body: CheckAvailabilityDto) {
+  async checkAvailability(
+    @Body() body: CheckAvailabilityDto,
+    @Req() req: { headers: Record<string, any>; ip?: string },
+  ) {
+    // 30/min keyed by device id, falling back to IP (requirements 7.1).
+    const deviceKey =
+      String(req.headers['x-device-id'] ?? '').trim() || req.ip || 'unknown';
+
+    await enforceRateLimit(this.redis, {
+      key: `rl:check_availability:${deviceKey}`,
+      limit: 30,
+      windowSeconds: 60,
+      message: 'Too many availability checks. Please slow down.',
+    });
+
     return this.authService.checkAvailability(body);
   }
 

@@ -699,7 +699,7 @@ export class AuthService {
     const sessionDid: string | null = stored.did ?? null;
     const family: string = stored.family ?? uuidv4();
 
-    if (sessionDid && String(sessionDid) !== String(deviceId ?? '')) {
+    if (deviceId && sessionDid && String(sessionDid) !== String(deviceId)) {
       throw apiError(
         HttpStatus.UNAUTHORIZED,
         'REFRESH_INVALID',

@@ -86,10 +86,13 @@ export class NotificationsService {
       unread_count: unreadCount,
       notifications: notifications.map((notif: any) => ({
         id: notif.id,
+        type: notif.type ?? 'NOTIFICATION',
         title: notif.title,
-        message: notif.body,
+        body: notif.body,
+        message: notif.body, // legacy alias
         read: notif.read,
-        createdAt: notif.created_at,
+        created_at: notif.created_at,
+        createdAt: notif.created_at, // legacy alias
       })),
     };
   }

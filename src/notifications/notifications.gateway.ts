@@ -6,6 +6,7 @@ import {
   WebSocketServer as NestWsServer,
 } from '@nestjs/websockets';
 import { IncomingMessage } from 'http';
+import { randomUUID } from 'crypto';
 import { WebSocket, WebSocketServer as WsServer } from 'ws';
 import { JwtTokenService } from '../common/services/jwt-token.service';
 
@@ -131,7 +132,7 @@ export class NotificationsGateway
       status,
       fraud_score: fraudScore ?? null,
       verdict: verdict ?? null,
-    });
+    }, transactionId);
   }
 
   emitPaymentReceived(
@@ -141,19 +142,39 @@ export class NotificationsGateway
     transactionId: string,
     newBalance: bigint | number,
   ): void {
-    this.emitToUser(userId, 'payment.received', {
-      amount: Number(amount),
-      sender_name: senderName,
-      transaction_id: transactionId,
-      balance: Number(newBalance),
-      new_balance: Number(newBalance),
-    });
+    this.emitToUser(
+      userId,
+      'payment.received',
+      {
+        amount: Number(amount),
+        sender_name: senderName,
+        transaction_id: transactionId,
+        balance: Number(newBalance),
+        new_balance: Number(newBalance),
+      },
+      transactionId,
+    );
   }
 
-  private emitToUser(userId: string, type: OutgoingType, data: unknown): void {
+  private emitToUser(
+    userId: string,
+    type: OutgoingType,
+    data: Record<string, unknown>,
+    transactionId?: string,
+  ): void {
+    // Every server event needs a unique id: the app dedupes by it.
+    const frame: Record<string, unknown> = {
+      id: `evt_${randomUUID()}`,
+      type,
+      ts: new Date().toISOString(),
+      ...(transactionId ? { transaction_id: transactionId } : {}),
+      data,
+    };
+    const payload = JSON.stringify(frame);
+
     for (const [client, state] of this.clients) {
       if (state.userId === userId && client.readyState === WebSocket.OPEN) {
-        this.send(client, type, data);
+        client.send(payload);
       }
     }
   }

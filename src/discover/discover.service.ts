@@ -5,6 +5,8 @@ import { RedisService } from '../common/services/redis.service';
 import { TrustService } from '../common/services/trust.service';
 import { resolveUserAvatarUrl } from '../common/utils/avatar.util';
 import { apiError } from '../common/errors/api-error';
+import { ActivityLogService } from '../common/services/activity-log.service';
+import { createHash } from 'crypto';
 
 const UUID_RE =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
@@ -24,7 +26,13 @@ export class DiscoverService {
     private readonly prisma: PrismaService,
     private readonly redis: RedisService,
     private readonly trust: TrustService,
+    private readonly activityLog: ActivityLogService,
   ) {}
+
+  /** Audit trail keeps a short hash, never the raw token. */
+  private tokenRef(token: string): string {
+    return createHash('sha256').update(token).digest('hex').slice(0, 12);
+  }
 
   // ── registration ────────────────────────────────────────────
 
@@ -63,6 +71,12 @@ export class DiscoverService {
     await this.redis.set(`discover:${value}`, record, ttl);
     await this.redis.set(`discover_seen:${value}`, record, this.SEEN_TTL);
     await this.redis.set(`discover_user:${kind}:${userId}`, value, ttl);
+
+    await this.activityLog.log(userId, 'DISCOVER_REGISTER', {
+      kind,
+      token_ref: this.tokenRef(value),
+      ttl,
+    });
 
     return {
       token: value,
@@ -147,6 +161,12 @@ export class DiscoverService {
 
     if (!record?.user_id) {
       const seen = await this.redis.get<any>(`discover_seen:${value}`);
+
+      await this.activityLog.log(viewerUserId, 'DISCOVER_RESOLVE_MISS', {
+        token_ref: this.tokenRef(value),
+        result: seen ? 'TOKEN_EXPIRED' : 'TOKEN_INVALID',
+      });
+
       if (seen) {
         throw apiError(
           HttpStatus.GONE,
@@ -181,6 +201,12 @@ export class DiscoverService {
         'Code not recognised.',
       );
     }
+
+    await this.activityLog.log(viewerUserId, 'DISCOVER_RESOLVE', {
+      token_ref: this.tokenRef(value),
+      result: 'RESOLVED',
+      target_id: targetId,
+    });
 
     const [relationship, trust, mutual] = await Promise.all([
       this.trust.relationship(viewerUserId, targetId),
